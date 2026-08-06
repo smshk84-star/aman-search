@@ -1,0 +1,10 @@
+{
+  "name": "AMAN Search",
+  "short_name": "AMAN Search",
+  "description": "Aman's independent search app",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#090d1a",
+  "theme_color": "#0b1020",
+  "icons": [{"src":"aman-mark.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
+}
