@@ -4,13 +4,23 @@ import {
   REQUEST_TIMEOUT_MS,
   clientKey,
   createRateLimiter,
-  extractAnswer,
+  extractGeminiAnswer,
   hasAllowedOrigin,
   json,
-  parseSse,
+  parseGeminiSse,
   publicApiError,
   sse,
 } from "./lib/search-utils.mjs";
+
+// ─── Gemini endpoint ──────────────────────────────────────────────────────────
+//
+// We use streamGenerateContent with ?alt=sse so the response is a plain
+// text/event-stream rather than the multipart/x-mixed-replace format.
+// The API key is sent as a header (x-goog-api-key) so it never appears in
+// the URL and is never logged by Netlify's request log.
+
+const GEMINI_ENDPOINT =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse";
 
 const rateLimit = createRateLimiter({ limit: 8, windowMs: 60_000 });
 const encoder = new TextEncoder();
@@ -20,28 +30,37 @@ const rateHeaders = (result) => ({
   "X-RateLimit-Remaining": String(result.remaining),
 });
 
-const errorMessage = (event) => event?.response?.error?.message || event?.error?.message || "The AI search request failed.";
-
 export const createSearchHandler = ({
   fetchImpl = fetch,
-  getApiKey = () => process.env.OPENAI_API_KEY,
+  getApiKey = () => process.env.GEMINI_API_KEY,
   limiter = rateLimit,
 } = {}) => async (request) => {
-  if (request.method !== "POST") return json(405, { error: "Method not allowed." }, { Allow: "POST" });
-  if (!hasAllowedOrigin(request)) return json(403, { error: "Cross-site search requests are not allowed." });
 
+  // ── Method + origin guard ────────────────────────────────────────────────
+  if (request.method !== "POST") {
+    return json(405, { error: "Method not allowed." }, { Allow: "POST" });
+  }
+  if (!hasAllowedOrigin(request)) {
+    return json(403, { error: "Cross-site search requests are not allowed." });
+  }
+
+  // ── Body size guard ──────────────────────────────────────────────────────
   const length = Number(request.headers.get("content-length"));
   if (Number.isFinite(length) && length > MAX_BODY_BYTES) {
     return json(413, { error: "Search request is too large." });
   }
 
+  // ── Parse + validate query ───────────────────────────────────────────────
   let query;
-  try { ({ query } = await request.json()); } catch { return json(400, { error: "Invalid JSON request body." }); }
+  try { ({ query } = await request.json()); } catch {
+    return json(400, { error: "Invalid JSON request body." });
+  }
   query = typeof query === "string" ? query.trim() : "";
   if (!query || query.length > MAX_QUERY_LENGTH) {
     return json(400, { error: "Enter a search query of up to 1,000 characters." });
   }
 
+  // ── Rate limit ───────────────────────────────────────────────────────────
   const allowed = limiter(clientKey(request));
   if (!allowed.allowed) {
     return json(429, { error: "Too many searches. Please wait a minute and try again." }, {
@@ -50,6 +69,7 @@ export const createSearchHandler = ({
     });
   }
 
+  // ── API key guard ────────────────────────────────────────────────────────
   const apiKey = getApiKey();
   if (!apiKey) {
     return json(503, {
@@ -58,33 +78,42 @@ export const createSearchHandler = ({
     }, rateHeaders(allowed));
   }
 
+  // ── Call Gemini ──────────────────────────────────────────────────────────
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException("Timed out", "TimeoutError")),
+    REQUEST_TIMEOUT_MS,
+  );
 
   try {
-    const response = await fetchImpl("https://api.openai.com/v1/responses", {
+    const response = await fetchImpl(GEMINI_ENDPOINT, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Accept: "text/event-stream",
-        Authorization: `Bearer ${apiKey}`,
+        "x-goog-api-key": apiKey,
       },
       body: JSON.stringify({
-        model: "gpt-5.6-terra",
-        reasoning: { effort: "low" },
-        tools: [{ type: "web_search", search_context_size: "medium" }],
-        tool_choice: "required",
-        include: ["web_search_call.action.sources"],
-        stream: true,
-        instructions: "You are AMAN Search. Answer the user's question with current web research. Be concise, factual, and use the user's language where appropriate. Cite factual claims with the web citations returned by the tool.",
-        input: query,
+        system_instruction: {
+          parts: [{
+            text: "You are AMAN Search. Answer the user's question with current web research. Be concise, factual, and cite your sources.",
+          }],
+        },
+        contents: [{
+          role: "user",
+          parts: [{ text: query }],
+        }],
+        tools: [{ googleSearch: {} }],
+        generationConfig: {
+          temperature: 1.0,
+        },
       }),
       signal: controller.signal,
     });
 
+    // ── Upstream error ─────────────────────────────────────────────────────
     if (!response.ok) {
       let payload = null;
-      try { payload = await response.json(); } catch { /* The upstream response was not JSON. */ }
+      try { payload = await response.json(); } catch { /* upstream body was not JSON */ }
       const retryAfter = response.headers.get("retry-after");
       clearTimeout(timeout);
       return json(response.status, { error: publicApiError(response.status, payload) }, {
@@ -98,36 +127,87 @@ export const createSearchHandler = ({
       return json(502, { error: "The AI search service returned an empty response." }, rateHeaders(allowed));
     }
 
+    // ── Stream SSE to client ───────────────────────────────────────────────
+    //
+    // Gemini sends one GenerateContentResponse JSON object per SSE event.
+    // Every chunk may carry a text delta in candidates[0].content.parts[].text.
+    // The final chunk (finishReason === "STOP") carries groundingMetadata with
+    // groundingChunks and groundingSupports for citations.
+    //
+    // We translate this into the frontend's existing three-event protocol:
+    //   delta   → incremental answer text
+    //   sources → full answer + annotations + sources (sent once, on finish)
+    //   done    → stream complete
+
     const stream = new ReadableStream({
       async start(controllerStream) {
         let streamedAnswer = "";
+        let finalGroundingChunks = [];
+        let finalGroundingSupports = [];
         let completed = false;
+
         try {
-          for await (const event of parseSse(response.body)) {
-            if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
-              streamedAnswer += event.delta;
-              controllerStream.enqueue(encoder.encode(sse("delta", { delta: event.delta })));
-              continue;
+          for await (const chunk of parseGeminiSse(response.body)) {
+            const candidate = chunk?.candidates?.[0];
+            if (!candidate) continue;
+
+            // Accumulate text delta from all content parts in this chunk.
+            const parts = candidate.content?.parts ?? [];
+            const deltaText = parts
+              .filter((p) => typeof p.text === "string")
+              .map((p) => p.text)
+              .join("");
+
+            if (deltaText) {
+              streamedAnswer += deltaText;
+              controllerStream.enqueue(
+                encoder.encode(sse("delta", { delta: deltaText })),
+              );
             }
 
-            if (event.type === "response.completed") {
-              const result = extractAnswer(event.response || event);
-              const answer = result.answer || streamedAnswer;
+            // Collect groundingMetadata — it arrives on the last chunk but we
+            // always overwrite so we keep whichever chunk is most complete.
+            const gm = candidate.groundingMetadata;
+            if (gm) {
+              if (Array.isArray(gm.groundingChunks) && gm.groundingChunks.length) {
+                finalGroundingChunks = gm.groundingChunks;
+              }
+              if (Array.isArray(gm.groundingSupports) && gm.groundingSupports.length) {
+                finalGroundingSupports = gm.groundingSupports;
+              }
+            }
+
+            // Finish when the model signals STOP (or any terminal reason).
+            if (candidate.finishReason && candidate.finishReason !== "OTHER") {
+              const answer = streamedAnswer;
               if (!answer) throw new Error("The AI search service returned no answer.");
-              controllerStream.enqueue(encoder.encode(sse("sources", { ...result, answer })));
+
+              const { annotations, sources } = extractGeminiAnswer(
+                finalGroundingChunks,
+                finalGroundingSupports,
+              );
+
+              controllerStream.enqueue(
+                encoder.encode(sse("sources", { answer, annotations, sources })),
+              );
               controllerStream.enqueue(encoder.encode(sse("done", {})));
               completed = true;
               break;
             }
-
-            if (event.type === "response.failed" || event.type === "error") {
-              throw new Error(errorMessage(event));
-            }
           }
 
+          // Stream ended without a STOP finishReason — emit what we have.
           if (!completed) {
             if (!streamedAnswer) throw new Error("The AI search service returned no answer.");
-            controllerStream.enqueue(encoder.encode(sse("sources", { answer: streamedAnswer, annotations: [], sources: [] })));
+
+            const { annotations, sources } = extractGeminiAnswer(
+              finalGroundingChunks,
+              finalGroundingSupports,
+            );
+
+            controllerStream.enqueue(
+              encoder.encode(sse("sources", { answer: streamedAnswer, annotations, sources })),
+            );
             controllerStream.enqueue(encoder.encode(sse("done", {})));
           }
         } catch (error) {
@@ -140,7 +220,10 @@ export const createSearchHandler = ({
           controllerStream.close();
         }
       },
-      cancel() { clearTimeout(timeout); controller.abort(); },
+      cancel() {
+        clearTimeout(timeout);
+        controller.abort();
+      },
     });
 
     return new Response(stream, {
@@ -153,6 +236,7 @@ export const createSearchHandler = ({
         ...rateHeaders(allowed),
       },
     });
+
   } catch (error) {
     clearTimeout(timeout);
     if (error?.name === "TimeoutError") {
