@@ -269,7 +269,8 @@ test("search handler proxies Gemini SSE output and emits delta / sources / done 
 
   const payload = JSON.parse(capturedRequest.options.body);
   assert.ok(Array.isArray(payload.tools), "tools must be an array");
-  assert.deepEqual(payload.tools, [{ googleSearch: {} }]);
+  // REST wire format requires snake_case "google_search", not camelCase "googleSearch"
+  assert.deepEqual(payload.tools, [{ google_search: {} }]);
   assert.equal(payload.contents[0].parts[0].text, "What is new?");
   assert.ok(payload.system_instruction?.parts?.[0]?.text, "system_instruction must be set");
 });

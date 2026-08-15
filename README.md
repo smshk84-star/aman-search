@@ -5,7 +5,7 @@ AMAN Search is a static PWA with a secure Netlify Function that calls the Google
 ## Architecture
 
 - `index.html` and `app.js`: the existing AMAN interface and streaming search client. Unchanged.
-- `netlify/functions/search.mjs`: server-only Gemini API proxy. It is the only file that reads `GEMINI_API_KEY`. Calls `streamGenerateContent` with the `googleSearch` tool and streams `delta`, `sources`, and `done` SSE events to the browser.
+- `netlify/functions/search.mjs`: server-only Gemini API proxy. It is the only file that reads `GEMINI_API_KEY`. Calls `streamGenerateContent` with the `google_search` grounding tool and streams `delta`, `sources`, and `done` SSE events to the browser.
 - `netlify/functions/lib/search-utils.mjs`: request validation, Gemini SSE parsing, `groundingMetadata` → citations/sources conversion, and a per-instance rate limiter.
 - `sw.js`: PWA app-shell caching. API requests (`/.netlify/functions/*`) are always network-only and never cached.
 

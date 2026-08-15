@@ -102,7 +102,7 @@ export const createSearchHandler = ({
           role: "user",
           parts: [{ text: query }],
         }],
-        tools: [{ googleSearch: {} }],
+        tools: [{ google_search: {} }],
         generationConfig: {
           temperature: 1.0,
         },
