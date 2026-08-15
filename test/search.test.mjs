@@ -262,7 +262,7 @@ test("search handler proxies Gemini SSE output and emits delta / sources / done 
   // Verify the upstream request shape.
   assert.equal(
     capturedRequest.url,
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse",
   );
   assert.equal(capturedRequest.options.headers["x-goog-api-key"], "test-gemini-key");
   assert.equal(capturedRequest.options.headers["Content-Type"], "application/json");

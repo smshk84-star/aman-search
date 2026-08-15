@@ -1,6 +1,6 @@
 # AMAN Search
 
-AMAN Search is a static PWA with a secure Netlify Function that calls the Google Gemini API (`gemini-2.5-flash`) with Google Search grounding. The existing AMAN interface is retained; answers stream into the page, then show linked citations and a source list derived from Gemini's `groundingMetadata`.
+AMAN Search is a static PWA with a secure Netlify Function that calls the Google Gemini API (`gemini-3.6-flash`) with Google Search grounding. The existing AMAN interface is retained; answers stream into the page, then show linked citations and a source list derived from Gemini's `groundingMetadata`.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ The app has no API key, `.env` file, or Gemini request in any frontend code.
 
 ## Required Netlify configuration
 
-1. Go to [Google AI Studio](https://aistudio.google.com/app/apikey) and create an API key. The free tier requires no billing information and includes Google Search grounding for `gemini-2.5-flash`.
+1. Go to [Google AI Studio](https://aistudio.google.com/app/apikey) and create an API key. The free tier requires no billing information and includes Google Search grounding for `gemini-3.6-flash`.
 2. In Netlify, open **Project configuration → Environment variables → Add a variable**.
 3. Add `GEMINI_API_KEY` with the key from step 1.
 4. Select **Production**, **Deploy Previews**, and **Branch deploys** as scopes.
@@ -39,7 +39,7 @@ The function converts this to the annotation shape that `app.js` already underst
 
 `app.js` uses these offsets to wrap the cited spans in `<a class="citation">` links, and renders a deduplicated source list below the answer. No frontend changes were needed.
 
-## Free-tier limits (gemini-2.5-flash, Google AI Studio)
+## Free-tier limits (gemini-3.6-flash, Google AI Studio)
 
 | Dimension | Free-tier limit |
 |-----------|----------------|

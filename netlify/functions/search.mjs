@@ -20,7 +20,7 @@ import {
 // the URL and is never logged by Netlify's request log.
 
 const GEMINI_ENDPOINT =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse";
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse";
 
 const rateLimit = createRateLimiter({ limit: 8, windowMs: 60_000 });
 const encoder = new TextEncoder();
@@ -103,9 +103,6 @@ export const createSearchHandler = ({
           parts: [{ text: query }],
         }],
         tools: [{ google_search: {} }],
-        generationConfig: {
-          temperature: 1.0,
-        },
       }),
       signal: controller.signal,
     });
