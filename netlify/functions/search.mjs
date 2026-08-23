@@ -4,13 +4,11 @@ import {
   REQUEST_TIMEOUT_MS,
   clientKey,
   createRateLimiter,
-  extractAnswer,
   hasAllowedOrigin,
   json,
-  parseSse,
-  publicApiError,
   sse,
 } from "./lib/search-utils.mjs";
+import { createGeminiProvider } from "./lib/gemini-provider.mjs";
 
 const rateLimit = createRateLimiter({ limit: 8, windowMs: 60_000 });
 const encoder = new TextEncoder();
@@ -20,11 +18,21 @@ const rateHeaders = (result) => ({
   "X-RateLimit-Remaining": String(result.remaining),
 });
 
-const errorMessage = (event) => event?.response?.error?.message || event?.error?.message || "The AI search request failed.";
+const combinedSignal = (signals) => {
+  const active = signals.filter(Boolean);
+  return active.length > 1 ? AbortSignal.any(active) : active[0];
+};
+
+const errorResponse = (error, headers) => json(error?.status || 502, {
+  ...(error?.code ? { code: error.code } : {}),
+  error: error?.message || "Unable to reach the AI search service. Please try again.",
+}, {
+  ...headers,
+  ...(error?.retryAfter ? { "Retry-After": error.retryAfter } : {}),
+});
 
 export const createSearchHandler = ({
-  fetchImpl = fetch,
-  getApiKey = () => process.env.OPENAI_API_KEY,
+  provider = createGeminiProvider(),
   limiter = rateLimit,
 } = {}) => async (request) => {
   if (request.method !== "POST") return json(405, { error: "Method not allowed." }, { Allow: "POST" });
@@ -50,116 +58,69 @@ export const createSearchHandler = ({
     });
   }
 
-  const apiKey = getApiKey();
-  if (!apiKey) {
+  if (!provider.isConfigured()) {
     return json(503, {
       code: "missing_api_key",
       error: "AI search has not been configured for this site yet.",
     }, rateHeaders(allowed));
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), REQUEST_TIMEOUT_MS);
+  const timeoutController = new AbortController();
+  const timeout = setTimeout(
+    () => timeoutController.abort(new DOMException("Timed out", "TimeoutError")),
+    REQUEST_TIMEOUT_MS,
+  );
+  const signal = combinedSignal([request.signal, timeoutController.signal]);
 
+  let upstream;
   try {
-    const response = await fetchImpl("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-5.6-terra",
-        reasoning: { effort: "low" },
-        tools: [{ type: "web_search", search_context_size: "medium" }],
-        tool_choice: "required",
-        include: ["web_search_call.action.sources"],
-        stream: true,
-        instructions: "You are AMAN Search. Answer the user's question with current web research. Be concise, factual, and use the user's language where appropriate. Cite factual claims with the web citations returned by the tool.",
-        input: query,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      let payload = null;
-      try { payload = await response.json(); } catch { /* The upstream response was not JSON. */ }
-      const retryAfter = response.headers.get("retry-after");
-      clearTimeout(timeout);
-      return json(response.status, { error: publicApiError(response.status, payload) }, {
-        ...rateHeaders(allowed),
-        ...(retryAfter ? { "Retry-After": retryAfter } : {}),
-      });
-    }
-
-    if (!response.body) {
-      clearTimeout(timeout);
-      return json(502, { error: "The AI search service returned an empty response." }, rateHeaders(allowed));
-    }
-
-    const stream = new ReadableStream({
-      async start(controllerStream) {
-        let streamedAnswer = "";
-        let completed = false;
-        try {
-          for await (const event of parseSse(response.body)) {
-            if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
-              streamedAnswer += event.delta;
-              controllerStream.enqueue(encoder.encode(sse("delta", { delta: event.delta })));
-              continue;
-            }
-
-            if (event.type === "response.completed") {
-              const result = extractAnswer(event.response || event);
-              const answer = result.answer || streamedAnswer;
-              if (!answer) throw new Error("The AI search service returned no answer.");
-              controllerStream.enqueue(encoder.encode(sse("sources", { ...result, answer })));
-              controllerStream.enqueue(encoder.encode(sse("done", {})));
-              completed = true;
-              break;
-            }
-
-            if (event.type === "response.failed" || event.type === "error") {
-              throw new Error(errorMessage(event));
-            }
-          }
-
-          if (!completed) {
-            if (!streamedAnswer) throw new Error("The AI search service returned no answer.");
-            controllerStream.enqueue(encoder.encode(sse("sources", { answer: streamedAnswer, annotations: [], sources: [] })));
-            controllerStream.enqueue(encoder.encode(sse("done", {})));
-          }
-        } catch (error) {
-          const message = error?.name === "TimeoutError"
-            ? "The AI search request timed out. Please try again."
-            : error?.message || "Unable to reach the AI search service. Please try again.";
-          controllerStream.enqueue(encoder.encode(sse("error", { error: message })));
-        } finally {
-          clearTimeout(timeout);
-          controllerStream.close();
-        }
-      },
-      cancel() { clearTimeout(timeout); controller.abort(); },
-    });
-
-    return new Response(stream, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-store, no-transform",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-        ...rateHeaders(allowed),
-      },
-    });
+    upstream = await provider.open(query, { signal });
   } catch (error) {
     clearTimeout(timeout);
-    if (error?.name === "TimeoutError") {
-      return json(504, { error: "The AI search request timed out. Please try again." }, rateHeaders(allowed));
-    }
-    return json(502, { error: "Unable to reach the AI search service. Please try again." }, rateHeaders(allowed));
+    return errorResponse(error, rateHeaders(allowed));
   }
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const event of provider.events(upstream)) {
+          if (event.type === "delta") {
+            controller.enqueue(encoder.encode(sse("delta", { delta: event.delta })));
+          } else if (event.type === "complete") {
+            controller.enqueue(encoder.encode(sse("sources", {
+              answer: event.answer,
+              annotations: event.annotations,
+              sources: event.sources,
+            })));
+            controller.enqueue(encoder.encode(sse("done", {})));
+          }
+        }
+      } catch (error) {
+        const message = error?.name === "TimeoutError"
+          ? "The AI search request timed out. Please try again."
+          : error?.message || "Unable to reach the AI search service. Please try again.";
+        controller.enqueue(encoder.encode(sse("error", { error: message })));
+      } finally {
+        clearTimeout(timeout);
+        controller.close();
+      }
+    },
+    cancel() {
+      clearTimeout(timeout);
+      timeoutController.abort(new DOMException("Cancelled", "AbortError"));
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-store, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      ...rateHeaders(allowed),
+    },
+  });
 };
 
 export default createSearchHandler();

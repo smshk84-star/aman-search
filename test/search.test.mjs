@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSearchHandler } from "../netlify/functions/search.mjs";
-import { createRateLimiter, extractAnswer, parseSse, uniqueSources } from "../netlify/functions/lib/search-utils.mjs";
+import { GEMINI_ENDPOINT, createGeminiProvider } from "../netlify/functions/lib/gemini-provider.mjs";
+import {
+  createRateLimiter,
+  extractGeminiAnswer,
+  parseGeminiSse,
+  uniqueSources,
+} from "../netlify/functions/lib/search-utils.mjs";
 
 const requestFor = (body, headers = {}) => new Request("https://aman-search.example/.netlify/functions/search", {
   method: "POST",
@@ -10,124 +16,228 @@ const requestFor = (body, headers = {}) => new Request("https://aman-search.exam
 });
 
 const allow = () => ({ allowed: true, limit: 8, remaining: 7, retryAfter: 60 });
+const providerError = (status, message, extra = {}) => Object.assign(new Error(message), { status, ...extra });
+const encoder = new TextEncoder();
+
+const sseBody = (events) => events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
 const readEvents = (text) => text.trim().split(/\n\n+/).map((block) => ({
   event: block.match(/^event:\s*(.+)$/m)?.[1],
   data: JSON.parse(block.match(/^data:\s*(.+)$/m)?.[1] || "{}"),
 }));
 
-test("extractAnswer returns citations and deduplicated sources", () => {
-  const response = {
-    output: [{ type: "message", content: [{
-      type: "output_text",
-      text: "Answer [1] [2]",
-      annotations: [
-        { type: "url_citation", url: "https://example.com/a", title: "Example", start_index: 7, end_index: 10 },
-        { type: "url_citation", url: "https://example.com/a", title: "Example", start_index: 11, end_index: 14 },
-      ],
-    }] }],
-  };
-  const result = extractAnswer(response);
-  assert.equal(result.answer, "Answer [1] [2]");
-  assert.equal(result.annotations.length, 2);
-  assert.deepEqual(result.sources, [{ url: "https://example.com/a", title: "Example" }]);
-  assert.deepEqual(uniqueSources([{ url: "https://example.com/b" }]), [{ url: "https://example.com/b", title: "example.com" }]);
-  assert.deepEqual(uniqueSources([{ url: "javascript:alert(1)" }]), []);
+const completeChunk = ({ text = "Hello world[1]", metadata = true } = {}) => ({
+  candidates: [{
+    content: { parts: [{ text }] },
+    finishReason: "STOP",
+    ...(metadata ? {
+      groundingMetadata: {
+        groundingChunks: [{ web: { uri: "https://example.com/world", title: "World source" } }],
+        groundingSupports: [{ segment: { startIndex: Math.max(0, text.length - 3), endIndex: text.length }, groundingChunkIndices: [0] }],
+      },
+    } : {}),
+  }],
 });
 
-test("parseSse reads fragmented upstream server-sent events", async () => {
-  const encoder = new TextEncoder();
+test("Gemini citations normalize sources and reject unsafe URLs", () => {
+  const result = extractGeminiAnswer(
+    [
+      { web: { uri: "https://example.com/a", title: "A" } },
+      { web: { uri: "javascript:alert(1)", title: "Bad" } },
+      { web: { uri: "https://example.com/a", title: "Duplicate" } },
+    ],
+    [{ segment: { startIndex: 0, endIndex: 3 }, groundingChunkIndices: [0, 1] }],
+  );
+
+  assert.deepEqual(result.sources, [{
+    id: "source-1", url: "https://example.com/a", title: "A", domain: "example.com", snippet: "", retrieved_at: null,
+  }]);
+  assert.equal(result.annotations.length, 1);
+  assert.equal(result.annotations[0].source_id, "source-1");
+  assert.deepEqual(uniqueSources([{ url: "data:text/html,unsafe" }]), []);
+});
+
+test("Gemini SSE parser handles fragmented data and malformed events", async () => {
   const stream = new ReadableStream({
     start(controller) {
-      controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"Hel"}\n\n'));
-      controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"lo"}\n\n'));
+      controller.enqueue(encoder.encode('data: {"candidates":[{"content":{"parts":[{"text":"Hel'));
+      controller.enqueue(encoder.encode('lo"}]}}]}\n\ndata: invalid-json\n\n'));
       controller.close();
     },
   });
-  const events = [];
-  for await (const event of parseSse(stream)) events.push(event);
-  assert.deepEqual(events.map((event) => event.delta), ["Hel", "lo"]);
+  const parsed = [];
+  for await (const event of parseGeminiSse(stream)) parsed.push(event);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].candidates[0].content.parts[0].text, "Hello");
 });
 
-test("rate limiter rejects the request after its configured limit", () => {
-  let time = 0;
-  const limit = createRateLimiter({ limit: 2, windowMs: 1_000, now: () => time });
-  assert.equal(limit("ip").allowed, true);
-  assert.equal(limit("ip").allowed, true);
-  assert.equal(limit("ip").allowed, false);
-  time = 1_001;
-  assert.equal(limit("ip").allowed, true);
-});
-
-test("search handler rejects invalid methods, foreign origins, and missing configuration", async () => {
-  const handler = createSearchHandler({ getApiKey: () => "", limiter: allow });
-  const method = await handler(new Request("https://aman-search.example/.netlify/functions/search"));
-  assert.equal(method.status, 405);
-  assert.equal(method.headers.get("allow"), "POST");
-
-  const foreign = await handler(new Request("https://aman-search.example/.netlify/functions/search", {
-    method: "POST", headers: { "Content-Type": "application/json", Origin: "https://attacker.example" }, body: "{}",
-  }));
-  assert.equal(foreign.status, 403);
-
-  const missingKey = await handler(requestFor({ query: "latest news" }));
-  assert.equal(missingKey.status, 503);
-  assert.equal((await missingKey.json()).code, "missing_api_key");
-});
-
-test("search handler proxies Responses streaming output and final citations", async () => {
-  let upstreamRequest;
-  const upstreamEvents = [
-    { type: "response.output_text.delta", delta: "Hello " },
-    {
-      type: "response.completed",
-      response: {
-        output: [{ type: "message", content: [{
-          type: "output_text",
-          text: "Hello world[1]",
-          annotations: [{ type: "url_citation", url: "https://example.com/world", title: "World source", start_index: 11, end_index: 14 }],
-        }] }],
-      },
-    },
-  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
-  const handler = createSearchHandler({
+test("Gemini provider sends the documented grounding request and yields normalized events", async () => {
+  let captured;
+  const provider = createGeminiProvider({
     getApiKey: () => "test-key",
-    limiter: allow,
     fetchImpl: async (url, options) => {
-      upstreamRequest = { url, options };
-      return new Response(upstreamEvents, { headers: { "Content-Type": "text/event-stream" } });
+      captured = { url, options };
+      return new Response(sseBody([
+        { candidates: [{ content: { parts: [{ text: "Hello " }] } }] },
+        completeChunk({ text: "world[1]" }),
+      ]), { headers: { "Content-Type": "text/event-stream" } });
     },
   });
 
-  const response = await handler(requestFor({ query: "What is new?" }));
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type"), /text\/event-stream/);
-  const body = await response.text();
-  const events = readEvents(body);
-  assert.deepEqual(events.map((event) => event.event), ["delta", "sources", "done"]);
-  assert.equal(events[1].data.answer, "Hello world[1]");
-  assert.deepEqual(events[1].data.sources, [{ url: "https://example.com/world", title: "World source" }]);
+  const body = await provider.open("What is new?");
+  const events = [];
+  for await (const event of provider.events(body)) events.push(event);
 
-  const payload = JSON.parse(upstreamRequest.options.body);
-  assert.equal(upstreamRequest.url, "https://api.openai.com/v1/responses");
-  assert.equal(upstreamRequest.options.headers.Authorization, "Bearer test-key");
-  assert.equal(payload.model, "gpt-5.6-terra");
-  assert.equal(payload.stream, true);
-  assert.equal(payload.tool_choice, "required");
-  assert.deepEqual(payload.tools, [{ type: "web_search", search_context_size: "medium" }]);
-  assert.equal(payload.input, "What is new?");
+  assert.equal(captured.url, GEMINI_ENDPOINT);
+  assert.equal(captured.options.headers["x-goog-api-key"], "test-key");
+  const payload = JSON.parse(captured.options.body);
+  assert.deepEqual(payload.tools, [{ google_search: {} }]);
+  assert.equal(payload.contents[0].parts[0].text, "What is new?");
+  assert.deepEqual(events.map((event) => event.type), ["delta", "delta", "complete"]);
+  assert.equal(events.at(-1).answer, "Hello world[1]");
+  assert.equal(events.at(-1).sources[0].domain, "example.com");
 });
 
-test("search handler preserves useful upstream rate-limit errors", async () => {
-  const handler = createSearchHandler({
+test("Gemini provider maps 401, 403, 404, 429, and 5xx responses without exposing upstream details", async (context) => {
+  for (const status of [401, 403, 404, 429, 500]) {
+    await context.test(`HTTP ${status}`, async () => {
+      const provider = createGeminiProvider({
+        getApiKey: () => "test-key",
+        maxAttempts: 1,
+        fetchImpl: async () => new Response(JSON.stringify({ error: { message: "private upstream diagnostic" } }), {
+          status,
+          headers: { "Content-Type": "application/json", ...(status === 429 ? { "Retry-After": "12" } : {}) },
+        }),
+      });
+      await assert.rejects(() => provider.open("query"), (error) => {
+        assert.equal(error.status, status);
+        assert.doesNotMatch(error.message, /private upstream diagnostic/);
+        if (status === 429) assert.equal(error.retryAfter, "12");
+        return true;
+      });
+    });
+  }
+});
+
+test("Gemini provider retries one transient 5xx response", async () => {
+  let calls = 0;
+  const pauses = [];
+  const provider = createGeminiProvider({
     getApiKey: () => "test-key",
-    limiter: allow,
-    fetchImpl: async () => new Response(JSON.stringify({ error: { message: "slow down" } }), {
-      status: 429,
-      headers: { "Content-Type": "application/json", "Retry-After": "12" },
+    sleep: async (milliseconds) => { pauses.push(milliseconds); },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) return new Response("temporary", { status: 503 });
+      return new Response(sseBody([completeChunk({ text: "Recovered" })]));
+    },
+  });
+  const body = await provider.open("query");
+  assert.ok(body);
+  assert.equal(calls, 2);
+  assert.deepEqual(pauses, [250]);
+});
+
+test("Gemini provider retries one transient network failure", async () => {
+  let calls = 0;
+  const pauses = [];
+  const provider = createGeminiProvider({
+    getApiKey: () => "test-key",
+    sleep: async (milliseconds) => { pauses.push(milliseconds); },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError("fetch failed");
+      return new Response(sseBody([completeChunk({ text: "Recovered" })]));
+    },
+  });
+  const body = await provider.open("query");
+  assert.ok(body);
+  assert.equal(calls, 2);
+  assert.deepEqual(pauses, [250]);
+});
+
+test("Gemini provider returns a bounded timeout and supports cancellation", async () => {
+  const timeoutProvider = createGeminiProvider({
+    getApiKey: () => "test-key",
+    maxAttempts: 1,
+    attemptTimeoutMs: 1,
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
     }),
   });
-  const response = await handler(requestFor({ query: "news" }));
+  await assert.rejects(() => timeoutProvider.open("query"), (error) => error.status === 504);
+
+  const cancellation = new AbortController();
+  cancellation.abort(new DOMException("Cancelled", "AbortError"));
+  const cancelledProvider = createGeminiProvider({ getApiKey: () => "test-key" });
+  await assert.rejects(() => cancelledProvider.open("query", { signal: cancellation.signal }), (error) => error.status === 499);
+});
+
+test("rate limiter and handler validation reject abusive or invalid requests", async () => {
+  let time = 0;
+  const limiter = createRateLimiter({ limit: 2, windowMs: 1_000, now: () => time });
+  assert.equal(limiter("ip").allowed, true);
+  assert.equal(limiter("ip").allowed, true);
+  assert.equal(limiter("ip").allowed, false);
+  time = 1_001;
+  assert.equal(limiter("ip").allowed, true);
+
+  const unavailable = { isConfigured: () => false };
+  const handler = createSearchHandler({ provider: unavailable, limiter: allow });
+  assert.equal((await handler(new Request("https://aman-search.example/.netlify/functions/search"))).status, 405);
+  assert.equal((await handler(new Request("https://aman-search.example/.netlify/functions/search", {
+    method: "POST", headers: { "Content-Type": "application/json", Origin: "https://attacker.example" }, body: "{}",
+  }))).status, 403);
+  assert.equal((await handler(requestFor({ query: "x".repeat(1001) }))).status, 400);
+  const missing = await handler(requestFor({ query: "news" }));
+  assert.equal(missing.status, 503);
+  assert.equal((await missing.json()).code, "missing_api_key");
+});
+
+test("search handler preserves the frontend SSE contract for success, empty sources, and malformed provider output", async (context) => {
+  await context.test("success with citations", async () => {
+    const provider = createGeminiProvider({
+      getApiKey: () => "test-key",
+      fetchImpl: async () => new Response(sseBody([
+        { candidates: [{ content: { parts: [{ text: "Hello " }] } }] },
+        completeChunk({ text: "world[1]" }),
+      ])),
+    });
+    const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "news" }));
+    assert.match(response.headers.get("content-type"), /text\/event-stream/);
+    const events = readEvents(await response.text());
+    assert.deepEqual(events.map((event) => event.event), ["delta", "delta", "sources", "done"]);
+    assert.equal(events[2].data.answer, "Hello world[1]");
+    assert.equal(events[2].data.sources.length, 1);
+  });
+
+  await context.test("answer with no useful sources", async () => {
+    const provider = createGeminiProvider({
+      getApiKey: () => "test-key",
+      fetchImpl: async () => new Response(sseBody([completeChunk({ text: "No sources available.", metadata: false })])),
+    });
+    const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "obscure topic" }));
+    const events = readEvents(await response.text());
+    assert.deepEqual(events.find((event) => event.event === "sources").data.sources, []);
+  });
+
+  await context.test("malformed provider event returns a clean SSE error", async () => {
+    const provider = createGeminiProvider({
+      getApiKey: () => "test-key",
+      fetchImpl: async () => new Response("data: malformed-json\n\n"),
+    });
+    const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "news" }));
+    const events = readEvents(await response.text());
+    assert.equal(events.at(-1).event, "error");
+    assert.match(events.at(-1).data.error, /no answer/i);
+  });
+});
+
+test("search handler returns JSON for provider errors before a stream starts", async () => {
+  const provider = {
+    isConfigured: () => true,
+    open: async () => { throw providerError(429, "Search is busy right now.", { retryAfter: "8" }); },
+  };
+  const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "news" }));
   assert.equal(response.status, 429);
-  assert.equal(response.headers.get("retry-after"), "12");
-  assert.equal((await response.json()).error, "Search is busy right now. Please wait a moment and try again.");
+  assert.equal(response.headers.get("retry-after"), "8");
+  assert.equal((await response.json()).error, "Search is busy right now.");
 });
