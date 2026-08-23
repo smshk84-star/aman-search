@@ -107,7 +107,9 @@ export const createGeminiProvider = ({
           || error?.name === "TimeoutError";
         const normalized = timedOut
           ? createProviderError(504, "The AI search request timed out. Please try again.", { retryable: true, name: "TimeoutError" })
-          : error;
+          : error instanceof TypeError
+            ? createProviderError(502, "Unable to reach the AI search service. Please try again.", { retryable: true })
+            : error;
         lastError = normalized;
 
         if (!isRetriable(normalized) || attempt === maxAttempts || signal?.aborted) break;

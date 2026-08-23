@@ -136,6 +136,19 @@ test("Gemini provider retries one transient 5xx response", async () => {
   assert.deepEqual(pauses, [250]);
 });
 
+test("Gemini provider does not expose a final network diagnostic", async () => {
+  const provider = createGeminiProvider({
+    getApiKey: () => "test-key",
+    maxAttempts: 1,
+    fetchImpl: async () => { throw new TypeError("internal DNS diagnostic"); },
+  });
+  await assert.rejects(() => provider.open("query"), (error) => {
+    assert.equal(error.status, 502);
+    assert.doesNotMatch(error.message, /internal DNS diagnostic/);
+    return true;
+  });
+});
+
 test("Gemini provider retries one transient network failure", async () => {
   let calls = 0;
   const pauses = [];
