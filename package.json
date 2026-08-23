@@ -8,7 +8,7 @@
     "node": ">=22 <23"
   },
   "scripts": {
-    "check": "node --check app.js && node --check sw.js && node --check netlify/functions/search.mjs && node --check netlify/functions/lib/search-utils.mjs",
+    "check": "node --check app.js && node --check sw.js && node --check netlify/functions/search.mjs && node --check netlify/functions/lib/search-utils.mjs && node --check netlify/functions/lib/gemini-provider.mjs",
     "test": "node --test test/search.test.mjs"
   }
 }

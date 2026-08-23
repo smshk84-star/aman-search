@@ -40,6 +40,15 @@ export const uniqueSources = (items = []) => {
     .map(({ url, title }) => ({ url, title: title || safeHostname(url) }));
 };
 
+export const normalizeSources = (items = []) => uniqueSources(items).map((source, index) => ({
+  id: `source-${index + 1}`,
+  url: source.url,
+  title: source.title,
+  domain: safeHostname(source.url),
+  snippet: "",
+  retrieved_at: null,
+}));
+
 // ─── Gemini groundingMetadata → citations + sources ──────────────────────────
 //
 // Gemini SSE shape (final chunk):
@@ -60,6 +69,13 @@ export const uniqueSources = (items = []) => {
 // the nearest sentence boundary and remain functional.
 
 export const extractGeminiAnswer = (chunks = [], supports = []) => {
+  const sources = normalizeSources(
+    chunks
+      .map((chunk) => chunk?.web)
+      .filter(Boolean)
+      .map(({ uri, title }) => ({ url: uri, title })),
+  );
+  const sourceByUrl = new Map(sources.map((source) => [source.url, source]));
   // Build a flat annotations array (one entry per chunk reference per support).
   const annotations = [];
   for (const support of supports) {
@@ -73,6 +89,7 @@ export const extractGeminiAnswer = (chunks = [], supports = []) => {
       const web = chunks[chunkIdx]?.web;
       if (!web?.uri || !isSafeWebUrl(web.uri)) continue;
       annotations.push({
+        source_id: sourceByUrl.get(web.uri)?.id,
         url: web.uri,
         title: web.title || safeHostname(web.uri),
         start_index: startIndex,
@@ -80,14 +97,6 @@ export const extractGeminiAnswer = (chunks = [], supports = []) => {
       });
     }
   }
-
-  // Build deduplicated sources list preserving first-seen order.
-  const sources = uniqueSources(
-    chunks
-      .map((c) => c?.web)
-      .filter(Boolean)
-      .map(({ uri, title }) => ({ url: uri, title })),
-  );
 
   return { annotations, sources };
 };
@@ -175,9 +184,10 @@ export const hasAllowedOrigin = (request) => {
 // ─── Upstream error mapping ───────────────────────────────────────────────────
 
 export const publicApiError = (status, payload) => {
-  if (status === 400) return payload?.error?.message || "The search request was invalid.";
+  if (status === 400) return "The search request was invalid.";
   if (status === 401 || status === 403) return "The AI search service is not configured correctly.";
+  if (status === 404) return "The requested AI search capability is unavailable.";
   if (status === 429) return "Search is busy right now. Please wait a moment and try again.";
   if (status >= 500) return "The AI search service is temporarily unavailable. Please try again.";
-  return payload?.error?.message || "The AI search request could not be completed.";
+  return "The AI search request could not be completed.";
 };

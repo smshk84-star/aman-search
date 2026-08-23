@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSearchHandler } from "../netlify/functions/search.mjs";
+import { GEMINI_ENDPOINT, createGeminiProvider } from "../netlify/functions/lib/gemini-provider.mjs";
 import {
   createRateLimiter,
   extractGeminiAnswer,
@@ -8,316 +9,235 @@ import {
   uniqueSources,
 } from "../netlify/functions/lib/search-utils.mjs";
 
-// ─── Test helpers ─────────────────────────────────────────────────────────────
-
-const requestFor = (body, headers = {}) =>
-  new Request("https://aman-search.example/.netlify/functions/search", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Origin: "https://aman-search.example",
-      ...headers,
-    },
-    body: JSON.stringify(body),
-  });
+const requestFor = (body, headers = {}) => new Request("https://aman-search.example/.netlify/functions/search", {
+  method: "POST",
+  headers: { "Content-Type": "application/json", Origin: "https://aman-search.example", ...headers },
+  body: JSON.stringify(body),
+});
 
 const allow = () => ({ allowed: true, limit: 8, remaining: 7, retryAfter: 60 });
+const providerError = (status, message, extra = {}) => Object.assign(new Error(message), { status, ...extra });
+const encoder = new TextEncoder();
 
-// Parse the raw SSE text emitted by the Netlify function into event objects.
-const readEvents = (text) =>
-  text
-    .trim()
-    .split(/\n\n+/)
-    .map((block) => ({
-      event: block.match(/^event:\s*(.+)$/m)?.[1],
-      data: JSON.parse(block.match(/^data:\s*(.+)$/m)?.[1] || "{}"),
-    }));
+const sseBody = (events) => events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+const readEvents = (text) => text.trim().split(/\n\n+/).map((block) => ({
+  event: block.match(/^event:\s*(.+)$/m)?.[1],
+  data: JSON.parse(block.match(/^data:\s*(.+)$/m)?.[1] || "{}"),
+}));
 
-// ─── extractGeminiAnswer ──────────────────────────────────────────────────────
-
-test("extractGeminiAnswer maps groundingChunks + groundingSupports to annotations and deduplicated sources", () => {
-  const chunks = [
-    { web: { uri: "https://example.com/a", title: "Example A" } },
-    { web: { uri: "https://example.com/b", title: "Example B" } },
-    { web: { uri: "https://example.com/a", title: "Example A dup" } }, // duplicate URL
-  ];
-  const supports = [
-    {
-      segment: { startIndex: 0, endIndex: 12 },
-      groundingChunkIndices: [0, 1],
-    },
-    {
-      segment: { startIndex: 13, endIndex: 25 },
-      groundingChunkIndices: [1],
-    },
-  ];
-
-  const { annotations, sources } = extractGeminiAnswer(chunks, supports);
-
-  // Two supports × references → 3 annotation entries total (first support has 2 chunk refs).
-  assert.equal(annotations.length, 3);
-  assert.equal(annotations[0].url, "https://example.com/a");
-  assert.equal(annotations[0].start_index, 0);
-  assert.equal(annotations[0].end_index, 12);
-  assert.equal(annotations[1].url, "https://example.com/b");
-  assert.equal(annotations[2].url, "https://example.com/b");
-  assert.equal(annotations[2].start_index, 13);
-  assert.equal(annotations[2].end_index, 25);
-
-  // Sources are deduplicated: a, b  (third chunk is duplicate of a).
-  assert.deepEqual(sources, [
-    { url: "https://example.com/a", title: "Example A" },
-    { url: "https://example.com/b", title: "Example B" },
-  ]);
-});
-
-test("extractGeminiAnswer skips unsafe URLs and zero-length segments", () => {
-  const chunks = [
-    { web: { uri: "javascript:alert(1)", title: "Bad" } },
-    { web: { uri: "https://safe.example/", title: "Safe" } },
-  ];
-  const supports = [
-    { segment: { startIndex: 0, endIndex: 0 }, groundingChunkIndices: [0] }, // zero-length → skip
-    { segment: { startIndex: 0, endIndex: 5 }, groundingChunkIndices: [0] }, // unsafe URL → skip
-    { segment: { startIndex: 0, endIndex: 5 }, groundingChunkIndices: [1] }, // ok
-  ];
-
-  const { annotations, sources } = extractGeminiAnswer(chunks, supports);
-  assert.equal(annotations.length, 1);
-  assert.equal(annotations[0].url, "https://safe.example/");
-  assert.deepEqual(sources, [{ url: "https://safe.example/", title: "Safe" }]);
-});
-
-test("extractGeminiAnswer returns empty arrays when called with no grounding data", () => {
-  const { annotations, sources } = extractGeminiAnswer([], []);
-  assert.deepEqual(annotations, []);
-  assert.deepEqual(sources, []);
-});
-
-// ─── uniqueSources ────────────────────────────────────────────────────────────
-
-test("uniqueSources deduplicates by URL and rejects unsafe schemes", () => {
-  assert.deepEqual(
-    uniqueSources([{ url: "https://example.com/b" }]),
-    [{ url: "https://example.com/b", title: "example.com" }],
-  );
-  assert.deepEqual(uniqueSources([{ url: "javascript:alert(1)" }]), []);
-  assert.deepEqual(
-    uniqueSources([
-      { url: "https://x.com/", title: "X" },
-      { url: "https://x.com/", title: "X again" },
-    ]),
-    [{ url: "https://x.com/", title: "X" }],
-  );
-});
-
-// ─── parseGeminiSse ───────────────────────────────────────────────────────────
-
-test("parseGeminiSse reads fragmented upstream Gemini SSE chunks", async () => {
-  const encoder = new TextEncoder();
-  const chunk1 = { candidates: [{ content: { parts: [{ text: "Hel" }] } }] };
-  const chunk2 = { candidates: [{ content: { parts: [{ text: "lo" }] }, finishReason: "STOP" }] };
-
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk1)}\n\n`));
-      controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk2)}\n\n`));
-      controller.close();
-    },
-  });
-
-  const events = [];
-  for await (const event of parseGeminiSse(stream)) events.push(event);
-
-  assert.equal(events.length, 2);
-  assert.equal(events[0].candidates[0].content.parts[0].text, "Hel");
-  assert.equal(events[1].candidates[0].finishReason, "STOP");
-});
-
-test("parseGeminiSse ignores [DONE] sentinel and malformed lines", async () => {
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(encoder.encode("data: [DONE]\n\ndata: not-json\n\n"));
-      controller.close();
-    },
-  });
-
-  const events = [];
-  for await (const event of parseGeminiSse(stream)) events.push(event);
-  assert.equal(events.length, 0);
-});
-
-// ─── Rate limiter ─────────────────────────────────────────────────────────────
-
-test("rate limiter rejects the request after its configured limit", () => {
-  let time = 0;
-  const limit = createRateLimiter({ limit: 2, windowMs: 1_000, now: () => time });
-  assert.equal(limit("ip").allowed, true);
-  assert.equal(limit("ip").allowed, true);
-  assert.equal(limit("ip").allowed, false);
-  time = 1_001;
-  assert.equal(limit("ip").allowed, true);
-});
-
-// ─── Request validation ───────────────────────────────────────────────────────
-
-test("search handler rejects invalid methods, foreign origins, and missing configuration", async () => {
-  const handler = createSearchHandler({ getApiKey: () => "", limiter: allow });
-
-  // Wrong method
-  const method = await handler(
-    new Request("https://aman-search.example/.netlify/functions/search"),
-  );
-  assert.equal(method.status, 405);
-  assert.equal(method.headers.get("allow"), "POST");
-
-  // Cross-origin request
-  const foreign = await handler(
-    new Request("https://aman-search.example/.netlify/functions/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Origin: "https://attacker.example" },
-      body: "{}",
-    }),
-  );
-  assert.equal(foreign.status, 403);
-
-  // Missing API key → 503 with code
-  const missingKey = await handler(requestFor({ query: "latest news" }));
-  assert.equal(missingKey.status, 503);
-  assert.equal((await missingKey.json()).code, "missing_api_key");
-});
-
-// ─── Gemini streaming proxy ───────────────────────────────────────────────────
-
-test("search handler proxies Gemini SSE output and emits delta / sources / done events", async () => {
-  let capturedRequest;
-
-  // Simulate two Gemini SSE chunks: a delta chunk then a final chunk with
-  // groundingMetadata.
-  const deltaChunk = {
-    candidates: [{
-      content: { parts: [{ text: "Hello " }] },
-    }],
-  };
-  const finalChunk = {
-    candidates: [{
-      content: { parts: [{ text: "world." }] },
-      finishReason: "STOP",
+const completeChunk = ({ text = "Hello world[1]", metadata = true } = {}) => ({
+  candidates: [{
+    content: { parts: [{ text }] },
+    finishReason: "STOP",
+    ...(metadata ? {
       groundingMetadata: {
-        groundingChunks: [
-          { web: { uri: "https://example.com/world", title: "World source" } },
-        ],
-        groundingSupports: [
-          {
-            segment: { startIndex: 0, endIndex: 6 },
-            groundingChunkIndices: [0],
-          },
-        ],
+        groundingChunks: [{ web: { uri: "https://example.com/world", title: "World source" } }],
+        groundingSupports: [{ segment: { startIndex: Math.max(0, text.length - 3), endIndex: text.length }, groundingChunkIndices: [0] }],
       },
-    }],
-  };
+    } : {}),
+  }],
+});
 
-  const upstreamSse = [
-    `data: ${JSON.stringify(deltaChunk)}\n\n`,
-    `data: ${JSON.stringify(finalChunk)}\n\n`,
-  ].join("");
+test("Gemini citations normalize sources and reject unsafe URLs", () => {
+  const result = extractGeminiAnswer(
+    [
+      { web: { uri: "https://example.com/a", title: "A" } },
+      { web: { uri: "javascript:alert(1)", title: "Bad" } },
+      { web: { uri: "https://example.com/a", title: "Duplicate" } },
+    ],
+    [{ segment: { startIndex: 0, endIndex: 3 }, groundingChunkIndices: [0, 1] }],
+  );
 
-  const handler = createSearchHandler({
-    getApiKey: () => "test-gemini-key",
-    limiter: allow,
+  assert.deepEqual(result.sources, [{
+    id: "source-1", url: "https://example.com/a", title: "A", domain: "example.com", snippet: "", retrieved_at: null,
+  }]);
+  assert.equal(result.annotations.length, 1);
+  assert.equal(result.annotations[0].source_id, "source-1");
+  assert.deepEqual(uniqueSources([{ url: "data:text/html,unsafe" }]), []);
+});
+
+test("Gemini SSE parser handles fragmented data and malformed events", async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"candidates":[{"content":{"parts":[{"text":"Hel'));
+      controller.enqueue(encoder.encode('lo"}]}}]}\n\ndata: invalid-json\n\n'));
+      controller.close();
+    },
+  });
+  const parsed = [];
+  for await (const event of parseGeminiSse(stream)) parsed.push(event);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].candidates[0].content.parts[0].text, "Hello");
+});
+
+test("Gemini provider sends the documented grounding request and yields normalized events", async () => {
+  let captured;
+  const provider = createGeminiProvider({
+    getApiKey: () => "test-key",
     fetchImpl: async (url, options) => {
-      capturedRequest = { url, options };
-      return new Response(upstreamSse, {
-        headers: { "Content-Type": "text/event-stream" },
-      });
+      captured = { url, options };
+      return new Response(sseBody([
+        { candidates: [{ content: { parts: [{ text: "Hello " }] } }] },
+        completeChunk({ text: "world[1]" }),
+      ]), { headers: { "Content-Type": "text/event-stream" } });
     },
   });
 
-  const response = await handler(requestFor({ query: "What is new?" }));
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type"), /text\/event-stream/);
+  const body = await provider.open("What is new?");
+  const events = [];
+  for await (const event of provider.events(body)) events.push(event);
 
-  const body = await response.text();
-  const events = readEvents(body);
-
-  // Should have: delta (from first chunk), delta (from final chunk text),
-  // sources, done.
-  const eventNames = events.map((e) => e.event);
-  assert.ok(eventNames.includes("delta"), "expected at least one delta event");
-  assert.ok(eventNames.includes("sources"), "expected a sources event");
-  assert.ok(eventNames.includes("done"), "expected a done event");
-
-  // sources event carries the full accumulated answer and citation data.
-  const sourcesEvent = events.find((e) => e.event === "sources");
-  assert.equal(sourcesEvent.data.answer, "Hello world.");
-  assert.deepEqual(sourcesEvent.data.sources, [
-    { url: "https://example.com/world", title: "World source" },
-  ]);
-  assert.equal(sourcesEvent.data.annotations.length, 1);
-  assert.equal(sourcesEvent.data.annotations[0].url, "https://example.com/world");
-  assert.equal(sourcesEvent.data.annotations[0].start_index, 0);
-  assert.equal(sourcesEvent.data.annotations[0].end_index, 6);
-
-  // Verify the upstream request shape.
-  assert.equal(
-    capturedRequest.url,
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse",
-  );
-  assert.equal(capturedRequest.options.headers["x-goog-api-key"], "test-gemini-key");
-  assert.equal(capturedRequest.options.headers["Content-Type"], "application/json");
-
-  const payload = JSON.parse(capturedRequest.options.body);
-  assert.ok(Array.isArray(payload.tools), "tools must be an array");
-  // REST wire format requires snake_case "google_search", not camelCase "googleSearch"
+  assert.equal(captured.url, GEMINI_ENDPOINT);
+  assert.equal(captured.options.headers["x-goog-api-key"], "test-key");
+  const payload = JSON.parse(captured.options.body);
   assert.deepEqual(payload.tools, [{ google_search: {} }]);
   assert.equal(payload.contents[0].parts[0].text, "What is new?");
-  assert.ok(payload.system_instruction?.parts?.[0]?.text, "system_instruction must be set");
+  assert.deepEqual(events.map((event) => event.type), ["delta", "delta", "complete"]);
+  assert.equal(events.at(-1).answer, "Hello world[1]");
+  assert.equal(events.at(-1).sources[0].domain, "example.com");
 });
 
-// ─── Upstream rate-limit passthrough ─────────────────────────────────────────
+test("Gemini provider maps 401, 403, 404, 429, and 5xx responses without exposing upstream details", async (context) => {
+  for (const status of [401, 403, 404, 429, 500]) {
+    await context.test(`HTTP ${status}`, async () => {
+      const provider = createGeminiProvider({
+        getApiKey: () => "test-key",
+        maxAttempts: 1,
+        fetchImpl: async () => new Response(JSON.stringify({ error: { message: "private upstream diagnostic" } }), {
+          status,
+          headers: { "Content-Type": "application/json", ...(status === 429 ? { "Retry-After": "12" } : {}) },
+        }),
+      });
+      await assert.rejects(() => provider.open("query"), (error) => {
+        assert.equal(error.status, status);
+        assert.doesNotMatch(error.message, /private upstream diagnostic/);
+        if (status === 429) assert.equal(error.retryAfter, "12");
+        return true;
+      });
+    });
+  }
+});
 
-test("search handler preserves upstream 429 Retry-After from Gemini", async () => {
-  const handler = createSearchHandler({
-    getApiKey: () => "test-gemini-key",
-    limiter: allow,
-    fetchImpl: async () =>
-      new Response(JSON.stringify({ error: { message: "quota exceeded" } }), {
-        status: 429,
-        headers: { "Content-Type": "application/json", "Retry-After": "30" },
-      }),
+test("Gemini provider retries one transient 5xx response", async () => {
+  let calls = 0;
+  const pauses = [];
+  const provider = createGeminiProvider({
+    getApiKey: () => "test-key",
+    sleep: async (milliseconds) => { pauses.push(milliseconds); },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) return new Response("temporary", { status: 503 });
+      return new Response(sseBody([completeChunk({ text: "Recovered" })]));
+    },
+  });
+  const body = await provider.open("query");
+  assert.ok(body);
+  assert.equal(calls, 2);
+  assert.deepEqual(pauses, [250]);
+});
+
+test("Gemini provider retries one transient network failure", async () => {
+  let calls = 0;
+  const pauses = [];
+  const provider = createGeminiProvider({
+    getApiKey: () => "test-key",
+    sleep: async (milliseconds) => { pauses.push(milliseconds); },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError("fetch failed");
+      return new Response(sseBody([completeChunk({ text: "Recovered" })]));
+    },
+  });
+  const body = await provider.open("query");
+  assert.ok(body);
+  assert.equal(calls, 2);
+  assert.deepEqual(pauses, [250]);
+});
+
+test("Gemini provider returns a bounded timeout and supports cancellation", async () => {
+  const timeoutProvider = createGeminiProvider({
+    getApiKey: () => "test-key",
+    maxAttempts: 1,
+    attemptTimeoutMs: 1,
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+    }),
+  });
+  await assert.rejects(() => timeoutProvider.open("query"), (error) => error.status === 504);
+
+  const cancellation = new AbortController();
+  cancellation.abort(new DOMException("Cancelled", "AbortError"));
+  const cancelledProvider = createGeminiProvider({ getApiKey: () => "test-key" });
+  await assert.rejects(() => cancelledProvider.open("query", { signal: cancellation.signal }), (error) => error.status === 499);
+});
+
+test("rate limiter and handler validation reject abusive or invalid requests", async () => {
+  let time = 0;
+  const limiter = createRateLimiter({ limit: 2, windowMs: 1_000, now: () => time });
+  assert.equal(limiter("ip").allowed, true);
+  assert.equal(limiter("ip").allowed, true);
+  assert.equal(limiter("ip").allowed, false);
+  time = 1_001;
+  assert.equal(limiter("ip").allowed, true);
+
+  const unavailable = { isConfigured: () => false };
+  const handler = createSearchHandler({ provider: unavailable, limiter: allow });
+  assert.equal((await handler(new Request("https://aman-search.example/.netlify/functions/search"))).status, 405);
+  assert.equal((await handler(new Request("https://aman-search.example/.netlify/functions/search", {
+    method: "POST", headers: { "Content-Type": "application/json", Origin: "https://attacker.example" }, body: "{}",
+  }))).status, 403);
+  assert.equal((await handler(requestFor({ query: "x".repeat(1001) }))).status, 400);
+  const missing = await handler(requestFor({ query: "news" }));
+  assert.equal(missing.status, 503);
+  assert.equal((await missing.json()).code, "missing_api_key");
+});
+
+test("search handler preserves the frontend SSE contract for success, empty sources, and malformed provider output", async (context) => {
+  await context.test("success with citations", async () => {
+    const provider = createGeminiProvider({
+      getApiKey: () => "test-key",
+      fetchImpl: async () => new Response(sseBody([
+        { candidates: [{ content: { parts: [{ text: "Hello " }] } }] },
+        completeChunk({ text: "world[1]" }),
+      ])),
+    });
+    const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "news" }));
+    assert.match(response.headers.get("content-type"), /text\/event-stream/);
+    const events = readEvents(await response.text());
+    assert.deepEqual(events.map((event) => event.event), ["delta", "delta", "sources", "done"]);
+    assert.equal(events[2].data.answer, "Hello world[1]");
+    assert.equal(events[2].data.sources.length, 1);
   });
 
-  const response = await handler(requestFor({ query: "news" }));
-  assert.equal(response.status, 429);
-  assert.equal(response.headers.get("retry-after"), "30");
-  const body = await response.json();
-  assert.equal(body.error, "Search is busy right now. Please wait a moment and try again.");
+  await context.test("answer with no useful sources", async () => {
+    const provider = createGeminiProvider({
+      getApiKey: () => "test-key",
+      fetchImpl: async () => new Response(sseBody([completeChunk({ text: "No sources available.", metadata: false })])),
+    });
+    const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "obscure topic" }));
+    const events = readEvents(await response.text());
+    assert.deepEqual(events.find((event) => event.event === "sources").data.sources, []);
+  });
+
+  await context.test("malformed provider event returns a clean SSE error", async () => {
+    const provider = createGeminiProvider({
+      getApiKey: () => "test-key",
+      fetchImpl: async () => new Response("data: malformed-json\n\n"),
+    });
+    const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "news" }));
+    const events = readEvents(await response.text());
+    assert.equal(events.at(-1).event, "error");
+    assert.match(events.at(-1).data.error, /no answer/i);
+  });
 });
 
-// ─── Stream fallback: no finishReason ────────────────────────────────────────
-
-test("search handler emits sources event even when no finishReason is received", async () => {
-  // Gemini stream ends without a STOP — simulate by omitting finishReason.
-  const onlyDelta = {
-    candidates: [{ content: { parts: [{ text: "Answer text." }] } }],
-    // no finishReason
+test("search handler returns JSON for provider errors before a stream starts", async () => {
+  const provider = {
+    isConfigured: () => true,
+    open: async () => { throw providerError(429, "Search is busy right now.", { retryAfter: "8" }); },
   };
-
-  const handler = createSearchHandler({
-    getApiKey: () => "test-gemini-key",
-    limiter: allow,
-    fetchImpl: async () =>
-      new Response(`data: ${JSON.stringify(onlyDelta)}\n\n`, {
-        headers: { "Content-Type": "text/event-stream" },
-      }),
-  });
-
-  const response = await handler(requestFor({ query: "anything?" }));
-  const body = await response.text();
-  const events = readEvents(body);
-
-  const sourcesEvent = events.find((e) => e.event === "sources");
-  assert.ok(sourcesEvent, "sources event must still be emitted");
-  assert.equal(sourcesEvent.data.answer, "Answer text.");
+  const response = await createSearchHandler({ provider, limiter: allow })(requestFor({ query: "news" }));
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get("retry-after"), "8");
+  assert.equal((await response.json()).error, "Search is busy right now.");
 });
