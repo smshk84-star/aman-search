@@ -1,38 +1,59 @@
 # AMAN Search
 
-AMAN Search is a static PWA with a secure Netlify Function that calls the OpenAI Responses API and its `web_search` tool. The existing AMAN interface is retained; answers stream into the page, then show linked citations and a source list.
+AMAN Search is a PWA search assistant with a server-side public-web search adapter. The core search path does not require Gemini, OpenAI, Tavily, or any manually configured provider API key.
 
 ## Architecture
 
-- `index.html` and `app.js`: the existing AMAN interface and streaming search client.
-- `netlify/functions/search.mjs`: server-only Responses API proxy. It is the only file that reads `OPENAI_API_KEY`.
-- `netlify/functions/lib/search-utils.mjs`: request validation, response/source parsing, and a per-instance rate limiter.
-- `sw.js`: PWA app-shell caching. API requests are always network-only and never cached.
+- `index.html` and `app.js`: existing AMAN interface, cancellation, streaming client, safe source links and citation mapping.
+- `netlify/functions/search.mjs`: server-only search endpoint with validation, rate limiting, timeout/error handling and SSE.
+- `netlify/functions/lib/no-key-search.mjs`: public web search adapter, result normalization, deduplication, relevance ranking, source contract and evidence-based synthesis.
+- `netlify/functions/lib/search-utils.mjs`: request/source utilities and rate limiter.
+- `sw.js`: PWA app-shell caching. Search requests remain network-only.
 
-The app deliberately has no API key, `.env` file, or OpenAI request in frontend code.
+## Provider independence
 
-## Required Netlify configuration
+The active search path uses public, browser-accessible search-result pages through the server-side adapter. It does not require a private API credential and does not bypass authentication, CAPTCHAs, paywalls, robots restrictions, or private/internal APIs.
 
-1. In Netlify, open **Project configuration → Environment variables → Add a variable**.
-2. Add `OPENAI_API_KEY` with an OpenAI API key that has billing and access to `gpt-5.6-terra` plus web search.
-3. Select **Production**, **Deploy Previews**, and **Branch deploys** as scopes.
-4. Save, then open **Deploys → Trigger deploy → Deploy site**.
+The answer engine is intentionally honest: when no actual generative model is configured, AMAN Search presents an evidence-based synthesis of retrieved snippets rather than claiming that a language model generated the answer.
 
-Never put the key in GitHub, `index.html`, `app.js`, or an `.env` file committed to the repository.
+## Result contract
 
-## Public-launch safeguards
+```json
+{
+  "id": "s1",
+  "title": "Example",
+  "url": "https://example.com/article",
+  "domain": "example.com",
+  "snippet": "Retrieved public result text.",
+  "retrievedAt": "2026-08-25T00:00:00.000Z"
+}
+```
 
-The function validates same-origin browser requests, limits a runtime instance to 8 searches per IP per minute, rejects oversize bodies, and forwards upstream `429` retry instructions. Serverless instances do not share memory, so this is not a substitute for an edge-level limit.
+## Answer contract
 
-Before making the site public, create a Netlify security/WAF request-rate rule for `/.netlify/functions/search`. Choose a limit suitable for the available OpenAI budget. Also verify that the Netlify site visibility is public if people should be able to open the app without a Netlify login.
+```json
+{
+  "answer": "Evidence-based answer with [1] citations.",
+  "citations": [{ "sourceId": "s1", "url": "https://example.com/article", "title": "Example", "startIndex": 0, "endIndex": 0 }],
+  "sources": []
+}
+```
+
+## SSE contract
+
+The frontend consumes the existing events: `delta`, `sources`, `done`, and `error`.
+
+## Security
+
+Same-origin validation, query-size validation, per-instance rate limiting, timeout handling, HTTP/HTTPS source validation, no credential exposure, no private endpoint access and no provider credentials in frontend code.
 
 ## Development checks
 
-The project uses Node 22, pinned in both `.nvmrc` and `netlify.toml`. It has no third-party runtime dependencies.
+Node 22 is pinned in `.nvmrc` and `netlify.toml`.
 
 ```sh
 npm run check
 npm test
 ```
 
-The tests cover source/citation handling, upstream SSE parsing, local rate limiting, request validation, the streamed Responses API request shape, and upstream rate-limit errors. A real end-to-end search can only be tested after `OPENAI_API_KEY` is configured in Netlify.
+For a live deployment, Netlify must be connected to this repository and publish the repository root with `netlify/functions` as the functions directory. No provider API-key environment variable is required for the core search path.
