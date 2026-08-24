@@ -25,19 +25,14 @@ const safeUrl = (value) => {
 
 const extractDuckDuckGo = (html) => {
   const results = [];
-  const blockPattern = /<div[^>]*class=["'][^"']*result[^"']*["'][^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
+  const pattern = /<a[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let match;
-
-  while ((match = blockPattern.exec(html)) && results.length < MAX_RESULTS_PER_ENGINE) {
-    const block = match[1];
-    const link = block.match(/<a[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
-    if (!link) continue;
-    const url = safeUrl(decodeHtml(link[1]));
+  while ((match = pattern.exec(html)) && results.length < MAX_RESULTS_PER_ENGINE) {
+    const url = safeUrl(decodeHtml(match[1]));
     if (!url) continue;
-    const snippet = block.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1];
-    const title = stripTags(link[2]);
-    const description = stripTags(snippet || "");
-    results.push({ title, url, description, engine: "DuckDuckGo" });
+    const tail = html.slice(match.index, match.index + 4_000);
+    const snippet = tail.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\//i)?.[1] || "";
+    results.push({ title: stripTags(match[2]), url, description: stripTags(snippet), engine: "DuckDuckGo" });
   }
   return results;
 };
