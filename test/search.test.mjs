@@ -16,40 +16,39 @@ const readEvents = (text) => text.trim().split(/\n\n+/).map((block) => ({
   data: JSON.parse(block.match(/^data:\s*(.+)$/m)?.[1] || "{}"),
 }));
 
-const duckHtml = `
-<div class="result results_links results_links_deep">
-  <h2 class="result__title"><a class="result__a" href="https://example.com/one">Example One</a></h2>
-  <a class="result__snippet">First useful result for the query.</a>
-</div>
-<div class="result results_links results_links_deep">
-  <h2 class="result__title"><a class="result__a" href="https://example.com/two">Example Two</a></h2>
-  <a class="result__snippet">Second useful result.</a>
-</div>`;
-
+const duckHtml = `<div class="result"><h2><a class="result__a" href="https://example.com/one">Example One</a></h2><a class="result__snippet">First useful result for the query.</a></div><div class="result"><h2><a class="result__a" href="https://example.com/two">Example Two</a></h2><a class="result__snippet">Second useful result.</a></div>`;
 const bingHtml = `<li class="b_algo"><h2><a href="https://example.com/three">Example Three</a></h2><p>Third useful result.</p></li>`;
+const fakeFetch = async (url) => new Response(url.includes("duckduckgo") ? duckHtml : bingHtml, { status: 200, headers: { "Content-Type": "text/html" } });
 
-const fakeFetch = async (url) => new Response(url.includes("duckduckgo") ? duckHtml : bingHtml, {
-  status: 200,
-  headers: { "Content-Type": "text/html" },
-});
-
-test("no-key search returns public web results without credentials", async () => {
+test("no-key search returns normalized ranked results and an evidence answer", async () => {
   const result = await searchWithoutApiKey("test query", { fetchImpl: fakeFetch });
   assert.ok(result.answer.includes("First useful result"));
   assert.equal(result.sources.length, 3);
+  assert.equal(result.sources[0].id, "s1");
   assert.equal(result.sources[0].url, "https://example.com/one");
-  assert.equal(result.sources[2].title, "Example Three");
+  assert.equal(result.sources[0].domain, "example.com");
+  assert.match(result.sources[0].retrievedAt, /^20/);
+  assert.equal(result.citations.length, 3);
+  assert.equal(result.citations[0].sourceId, "s1");
 });
 
 test("no-key search deduplicates identical URLs", async () => {
   const html = `${duckHtml.replace("example.com/two", "example.com/one")}\n${bingHtml}`;
-  const result = await searchWithoutApiKey("test query", {
-    fetchImpl: async () => new Response(html, { status: 200 }),
-  });
+  const result = await searchWithoutApiKey("test query", { fetchImpl: async () => new Response(html, { status: 200 }) });
   assert.equal(new Set(result.sources.map((source) => source.url)).size, result.sources.length);
 });
 
-test("search handler rejects invalid methods, foreign origins, and never checks an API key", async () => {
+test("unsafe URLs are discarded", async () => {
+  const html = `<a class="result__a" href="javascript:alert(1)">Bad</a><a class="result__a" href="https://safe.example/a">Safe</a><a class="result__snippet">Safe result</a>`;
+  const result = await searchWithoutApiKey("safe", { fetchImpl: async () => new Response(html, { status: 200 }) });
+  assert.equal(result.sources.every((source) => /^https?:$/.test(new URL(source.url).protocol)), true);
+});
+
+test("empty public results produce a controlled failure", async () => {
+  await assert.rejects(() => searchWithoutApiKey("nothing", { fetchImpl: async () => new Response("", { status: 200 }) }), /No public search source returned results/);
+});
+
+test("search handler preserves SSE contract and never checks an API key", async () => {
   const handler = createSearchHandler({ fetchImpl: fakeFetch, limiter: allow });
   const method = await handler(new Request("https://aman-search.example/.netlify/functions/search"));
   assert.equal(method.status, 405);
@@ -62,8 +61,9 @@ test("search handler rejects invalid methods, foreign origins, and never checks 
   const response = await handler(requestFor({ query: "latest news" }));
   assert.equal(response.status, 200);
   const events = readEvents(await response.text());
-  assert.deepEqual(events.map((event) => event.event), ["delta", "sources", "done"]);
-  assert.equal(events[1].data.sources.length, 3);
+  assert.deepEqual(events.map((event) => event.event), ["delta", "delta", "delta", "delta", "sources", "done"]);
+  assert.equal(events[4].data.sources.length, 3);
+  assert.equal(events[4].data.citations[0].sourceId, "s1");
 });
 
 test("rate limiter rejects the request after its configured limit", () => {
