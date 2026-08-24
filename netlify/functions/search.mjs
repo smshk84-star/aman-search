@@ -17,27 +17,27 @@ const rateHeaders = (result) => ({
   "X-RateLimit-Remaining": String(result.remaining),
 });
 
+const streamText = (controller, text) => {
+  const chunks = text.match(/.{1,90}(?:\s+|$)/g) || [text];
+  for (const chunk of chunks) controller.enqueue(encoder.encode(sse("delta", { delta: chunk })));
+};
+
 export const createSearchHandler = ({ fetchImpl = fetch, limiter = rateLimit } = {}) => async (request) => {
   if (request.method !== "POST") return json(405, { error: "Method not allowed." }, { Allow: "POST" });
   if (!hasAllowedOrigin(request)) return json(403, { error: "Cross-site search requests are not allowed." });
 
   const length = Number(request.headers.get("content-length"));
-  if (Number.isFinite(length) && length > MAX_BODY_BYTES) {
-    return json(413, { error: "Search request is too large." });
-  }
+  if (Number.isFinite(length) && length > MAX_BODY_BYTES) return json(413, { error: "Search request is too large." });
 
   let query;
   try { ({ query } = await request.json()); } catch { return json(400, { error: "Invalid JSON request body." }); }
   query = typeof query === "string" ? query.trim() : "";
-  if (!query || query.length > MAX_QUERY_LENGTH) {
-    return json(400, { error: "Enter a search query of up to 1,000 characters." });
-  }
+  if (!query || query.length > MAX_QUERY_LENGTH) return json(400, { error: "Enter a search query of up to 1,000 characters." });
 
   const allowed = limiter(clientKey(request));
   if (!allowed.allowed) {
     return json(429, { error: "Too many searches. Please wait a minute and try again." }, {
-      ...rateHeaders(allowed),
-      "Retry-After": String(allowed.retryAfter),
+      ...rateHeaders(allowed), "Retry-After": String(allowed.retryAfter),
     });
   }
 
@@ -45,13 +45,12 @@ export const createSearchHandler = ({ fetchImpl = fetch, limiter = rateLimit } =
     const result = await searchWithoutApiKey(query, { fetchImpl });
     const stream = new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode(sse("delta", { delta: result.answer })));
+        streamText(controller, result.answer);
         controller.enqueue(encoder.encode(sse("sources", result)));
         controller.enqueue(encoder.encode(sse("done", {})));
         controller.close();
       },
     });
-
     return new Response(stream, {
       status: 200,
       headers: {
