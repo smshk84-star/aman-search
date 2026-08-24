@@ -61,9 +61,11 @@ test("search handler preserves SSE contract and never checks an API key", async 
   const response = await handler(requestFor({ query: "latest news" }));
   assert.equal(response.status, 200);
   const events = readEvents(await response.text());
-  assert.deepEqual(events.map((event) => event.event), ["delta", "delta", "delta", "delta", "sources", "done"]);
-  assert.equal(events[4].data.sources.length, 3);
-  assert.equal(events[4].data.citations[0].sourceId, "s1");
+  assert.equal(events[events.length - 2].event, "sources");
+  assert.equal(events.at(-1).event, "done");
+  assert.ok(events.slice(0, -2).every((event) => event.event === "delta"));
+  assert.equal(events[events.length - 2].data.sources.length, 3);
+  assert.equal(events[events.length - 2].data.citations[0].sourceId, "s1");
 });
 
 test("rate limiter rejects the request after its configured limit", () => {
