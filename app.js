@@ -38,16 +38,17 @@ const renderResults = ({ answer, annotations = [], sources = [], streaming = fal
   const sourceCount = safeSources.length;
   const answerHtml = streaming ? esc(answer) : linkedAnswer(answer, annotations);
   const sourceHtml = sourceCount ? `
-    <div class="result-count">Sources</div>
+    <div class="result-count">Web sources</div>
     <div class="sources">${safeSources.map((source, index) => `
       <a class="source" href="${esc(source.url)}" target="_blank" rel="noopener noreferrer">
         <span class="source-title">${index + 1}. ${esc(source.title || safeDomain(source.url))}</span>
         <span class="domain">${esc(source.url)}</span>
+        ${source.description ? `<span class="domain">${esc(source.description)}</span>` : ""}
       </a>`).join("")}</div>` : "";
 
   results.innerHTML = `
-    <div class="result-count">AI answer${streaming ? " · researching live sources…" : ` · ${sourceCount} web source${sourceCount === 1 ? "" : "s"}`}</div>
-    <article class="answer">${answerHtml || "Researching reliable web sources…"}</article>${sourceHtml}`;
+    <div class="result-count">AMAN Search${streaming ? " · searching live sources…" : ` · ${sourceCount} web source${sourceCount === 1 ? "" : "s"}`}</div>
+    <article class="answer">${answerHtml || "Searching the live web…"}</article>${sourceHtml}`;
 };
 
 async function* readSse(body) {
@@ -106,8 +107,8 @@ async function search() {
 
   go.disabled = true;
   go.textContent = "Searching…";
-  status.textContent = "● Searching the live web and preparing an AI answer…";
-  results.innerHTML = '<div class="empty">Researching reliable web sources…</div>';
+  status.textContent = "● Searching public web sources…";
+  results.innerHTML = '<div class="empty">Searching the live web…</div>';
 
   try {
     const response = await fetch("/.netlify/functions/search", {
@@ -116,16 +117,14 @@ async function search() {
       body: JSON.stringify({ query }),
       signal: controller.signal,
     });
-    if (!response.ok) {
-      throw await readError(response);
-    }
+    if (!response.ok) throw await readError(response);
 
     if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) {
       const data = await response.json();
       answer = data.answer || "";
       annotations = data.annotations || [];
       sources = data.sources || [];
-      if (!answer) throw { message: "The AI search service returned no answer." };
+      if (!answer) throw { message: "The search service returned no results." };
       renderResults({ answer, annotations, sources });
     } else {
       for await (const { event, data } of readSse(response.body)) {
@@ -144,15 +143,12 @@ async function search() {
       }
     }
 
-    if (!answer) throw { message: "The AI search service returned no answer." };
-    status.textContent = "● Live web results with cited sources";
+    if (!answer) throw { message: "The search service returned no answer." };
+    status.textContent = "● Live web results · no API key required";
   } catch (error) {
     if (error.name === "AbortError") return;
     const message = error.message || "Search request failed. Please try again.";
-    const hint = error.code === "missing_api_key"
-      ? "The site owner needs to finish the secure Netlify API-key setup."
-      : "Please try again in a moment.";
-    results.innerHTML = `<div class="empty"><b>Search is not available right now.</b><br>${esc(message)}<br><br>${esc(hint)}</div>`;
+    results.innerHTML = `<div class="empty"><b>Search is not available right now.</b><br>${esc(message)}<br><br>AMAN Search does not require a private API key.</div>`;
     status.textContent = "● Search temporarily unavailable";
   } finally {
     if (activeSearch === controller) {
