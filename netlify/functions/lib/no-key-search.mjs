@@ -18,6 +18,7 @@ const safeUrl = (value) => {
 
 const domainOf = (url) => {
   try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return "unknown"; }
+};
 
 const extractDuckDuckGo = (html) => {
   const results = [];
