@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSearchHandler } from "../netlify/functions/search.mjs";
-import { createRateLimiter, extractAnswer, parseSse, uniqueSources } from "../netlify/functions/lib/search-utils.mjs";
+import { searchWithoutApiKey } from "../netlify/functions/lib/no-key-search.mjs";
+import { createRateLimiter } from "../netlify/functions/lib/search-utils.mjs";
 
 const requestFor = (body, headers = {}) => new Request("https://aman-search.example/.netlify/functions/search", {
   method: "POST",
@@ -9,43 +10,60 @@ const requestFor = (body, headers = {}) => new Request("https://aman-search.exam
   body: JSON.stringify(body),
 });
 
-const allow = () => ({ allowed: true, limit: 8, remaining: 7, retryAfter: 60 });
+const allow = () => ({ allowed: true, limit: 20, remaining: 19, retryAfter: 60 });
 const readEvents = (text) => text.trim().split(/\n\n+/).map((block) => ({
   event: block.match(/^event:\s*(.+)$/m)?.[1],
   data: JSON.parse(block.match(/^data:\s*(.+)$/m)?.[1] || "{}"),
 }));
 
-test("extractAnswer returns citations and deduplicated sources", () => {
-  const response = {
-    output: [{ type: "message", content: [{
-      type: "output_text",
-      text: "Answer [1] [2]",
-      annotations: [
-        { type: "url_citation", url: "https://example.com/a", title: "Example", start_index: 7, end_index: 10 },
-        { type: "url_citation", url: "https://example.com/a", title: "Example", start_index: 11, end_index: 14 },
-      ],
-    }] }],
-  };
-  const result = extractAnswer(response);
-  assert.equal(result.answer, "Answer [1] [2]");
-  assert.equal(result.annotations.length, 2);
-  assert.deepEqual(result.sources, [{ url: "https://example.com/a", title: "Example" }]);
-  assert.deepEqual(uniqueSources([{ url: "https://example.com/b" }]), [{ url: "https://example.com/b", title: "example.com" }]);
-  assert.deepEqual(uniqueSources([{ url: "javascript:alert(1)" }]), []);
+const duckHtml = `
+<div class="result results_links results_links_deep">
+  <h2 class="result__title"><a class="result__a" href="https://example.com/one">Example One</a></h2>
+  <a class="result__snippet">First useful result for the query.</a>
+</div>
+<div class="result results_links results_links_deep">
+  <h2 class="result__title"><a class="result__a" href="https://example.com/two">Example Two</a></h2>
+  <a class="result__snippet">Second useful result.</a>
+</div>`;
+
+const bingHtml = `<li class="b_algo"><h2><a href="https://example.com/three">Example Three</a></h2><p>Third useful result.</p></li>`;
+
+const fakeFetch = async (url) => new Response(url.includes("duckduckgo") ? duckHtml : bingHtml, {
+  status: 200,
+  headers: { "Content-Type": "text/html" },
 });
 
-test("parseSse reads fragmented upstream server-sent events", async () => {
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"Hel"}\n\n'));
-      controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"lo"}\n\n'));
-      controller.close();
-    },
+test("no-key search returns public web results without credentials", async () => {
+  const result = await searchWithoutApiKey("test query", { fetchImpl: fakeFetch });
+  assert.ok(result.answer.includes("First useful result"));
+  assert.equal(result.sources.length, 3);
+  assert.equal(result.sources[0].url, "https://example.com/one");
+  assert.equal(result.sources[2].title, "Example Three");
+});
+
+test("no-key search deduplicates identical URLs", async () => {
+  const html = `${duckHtml.replace("example.com/two", "example.com/one")}\n${bingHtml}`;
+  const result = await searchWithoutApiKey("test query", {
+    fetchImpl: async () => new Response(html, { status: 200 }),
   });
-  const events = [];
-  for await (const event of parseSse(stream)) events.push(event);
-  assert.deepEqual(events.map((event) => event.delta), ["Hel", "lo"]);
+  assert.equal(new Set(result.sources.map((source) => source.url)).size, result.sources.length);
+});
+
+test("search handler rejects invalid methods, foreign origins, and never checks an API key", async () => {
+  const handler = createSearchHandler({ fetchImpl: fakeFetch, limiter: allow });
+  const method = await handler(new Request("https://aman-search.example/.netlify/functions/search"));
+  assert.equal(method.status, 405);
+
+  const foreign = await handler(new Request("https://aman-search.example/.netlify/functions/search", {
+    method: "POST", headers: { "Content-Type": "application/json", Origin: "https://attacker.example" }, body: "{}",
+  }));
+  assert.equal(foreign.status, 403);
+
+  const response = await handler(requestFor({ query: "latest news" }));
+  assert.equal(response.status, 200);
+  const events = readEvents(await response.text());
+  assert.deepEqual(events.map((event) => event.event), ["delta", "sources", "done"]);
+  assert.equal(events[1].data.sources.length, 3);
 });
 
 test("rate limiter rejects the request after its configured limit", () => {
@@ -58,76 +76,8 @@ test("rate limiter rejects the request after its configured limit", () => {
   assert.equal(limit("ip").allowed, true);
 });
 
-test("search handler rejects invalid methods, foreign origins, and missing configuration", async () => {
-  const handler = createSearchHandler({ getApiKey: () => "", limiter: allow });
-  const method = await handler(new Request("https://aman-search.example/.netlify/functions/search"));
-  assert.equal(method.status, 405);
-  assert.equal(method.headers.get("allow"), "POST");
-
-  const foreign = await handler(new Request("https://aman-search.example/.netlify/functions/search", {
-    method: "POST", headers: { "Content-Type": "application/json", Origin: "https://attacker.example" }, body: "{}",
-  }));
-  assert.equal(foreign.status, 403);
-
-  const missingKey = await handler(requestFor({ query: "latest news" }));
-  assert.equal(missingKey.status, 503);
-  assert.equal((await missingKey.json()).code, "missing_api_key");
-});
-
-test("search handler proxies Responses streaming output and final citations", async () => {
-  let upstreamRequest;
-  const upstreamEvents = [
-    { type: "response.output_text.delta", delta: "Hello " },
-    {
-      type: "response.completed",
-      response: {
-        output: [{ type: "message", content: [{
-          type: "output_text",
-          text: "Hello world[1]",
-          annotations: [{ type: "url_citation", url: "https://example.com/world", title: "World source", start_index: 11, end_index: 14 }],
-        }] }],
-      },
-    },
-  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
-  const handler = createSearchHandler({
-    getApiKey: () => "test-key",
-    limiter: allow,
-    fetchImpl: async (url, options) => {
-      upstreamRequest = { url, options };
-      return new Response(upstreamEvents, { headers: { "Content-Type": "text/event-stream" } });
-    },
-  });
-
-  const response = await handler(requestFor({ query: "What is new?" }));
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type"), /text\/event-stream/);
-  const body = await response.text();
-  const events = readEvents(body);
-  assert.deepEqual(events.map((event) => event.event), ["delta", "sources", "done"]);
-  assert.equal(events[1].data.answer, "Hello world[1]");
-  assert.deepEqual(events[1].data.sources, [{ url: "https://example.com/world", title: "World source" }]);
-
-  const payload = JSON.parse(upstreamRequest.options.body);
-  assert.equal(upstreamRequest.url, "https://api.openai.com/v1/responses");
-  assert.equal(upstreamRequest.options.headers.Authorization, "Bearer test-key");
-  assert.equal(payload.model, "gpt-5.6-terra");
-  assert.equal(payload.stream, true);
-  assert.equal(payload.tool_choice, "required");
-  assert.deepEqual(payload.tools, [{ type: "web_search", search_context_size: "medium" }]);
-  assert.equal(payload.input, "What is new?");
-});
-
-test("search handler preserves useful upstream rate-limit errors", async () => {
-  const handler = createSearchHandler({
-    getApiKey: () => "test-key",
-    limiter: allow,
-    fetchImpl: async () => new Response(JSON.stringify({ error: { message: "slow down" } }), {
-      status: 429,
-      headers: { "Content-Type": "application/json", "Retry-After": "12" },
-    }),
-  });
-  const response = await handler(requestFor({ query: "news" }));
-  assert.equal(response.status, 429);
-  assert.equal(response.headers.get("retry-after"), "12");
-  assert.equal((await response.json()).error, "Search is busy right now. Please wait a moment and try again.");
+test("search handler validates query size", async () => {
+  const handler = createSearchHandler({ fetchImpl: fakeFetch, limiter: allow });
+  const response = await handler(requestFor({ query: "x".repeat(1001) }));
+  assert.equal(response.status, 400);
 });
