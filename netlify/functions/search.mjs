@@ -8,7 +8,7 @@ import {
   json,
   sse,
 } from "./lib/search-utils.mjs";
-import { createGeminiProvider } from "./lib/gemini-provider.mjs";
+import { createConfiguredSearchGateway, createSearchGateway } from "./lib/search-gateway.mjs";
 
 const rateLimit = createRateLimiter({ limit: 8, windowMs: 60_000 });
 const encoder = new TextEncoder();
@@ -32,7 +32,8 @@ const errorResponse = (error, headers) => json(error?.status || 502, {
 });
 
 export const createSearchHandler = ({
-  provider = createGeminiProvider(),
+  provider,
+  gateway = provider ? createSearchGateway({ primary: provider }) : createConfiguredSearchGateway(),
   limiter = rateLimit,
 } = {}) => async (request) => {
   if (request.method !== "POST") return json(405, { error: "Method not allowed." }, { Allow: "POST" });
@@ -58,7 +59,7 @@ export const createSearchHandler = ({
     });
   }
 
-  if (!provider.isConfigured()) {
+  if (!gateway.isConfigured()) {
     return json(503, {
       code: "missing_api_key",
       error: "AI search has not been configured for this site yet.",
@@ -74,7 +75,7 @@ export const createSearchHandler = ({
 
   let upstream;
   try {
-    upstream = await provider.open(query, { signal });
+    upstream = await gateway.open({ query, limit: 10, safeSearch: true }, { signal });
   } catch (error) {
     clearTimeout(timeout);
     return errorResponse(error, rateHeaders(allowed));
@@ -83,7 +84,7 @@ export const createSearchHandler = ({
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        for await (const event of provider.events(upstream)) {
+        for await (const event of gateway.events(upstream)) {
           if (event.type === "delta") {
             controller.enqueue(encoder.encode(sse("delta", { delta: event.delta })));
           } else if (event.type === "complete") {
@@ -91,6 +92,7 @@ export const createSearchHandler = ({
               answer: event.answer,
               annotations: event.annotations,
               sources: event.sources,
+              developmentMock: Boolean(event.developmentMock),
             })));
             controller.enqueue(encoder.encode(sse("done", {})));
           }

@@ -1,5 +1,8 @@
-const CACHE = "aman-search-v2";
-const APP_SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest", "./aman-mark.svg"];
+const CACHE = "aman-os-v1";
+const APP_SHELL = [
+  "./", "./index.html", "./styles.css", "./app.js", "./manifest.webmanifest", "./aman-mark.svg",
+  "./lib/os/store.mjs", "./lib/os/agents.mjs", "./lib/os/files.mjs",
+];
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -9,7 +12,7 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) => Promise.all(keys
-      .filter((key) => key.startsWith("aman-search-") && key !== CACHE)
+      .filter((key) => (key.startsWith("aman-search-") || key.startsWith("aman-os-")) && key !== CACHE)
       .map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   );

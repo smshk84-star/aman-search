@@ -1,14 +1,14 @@
 {
-  "name": "aman-search",
+  "name": "aman-os",
   "private": true,
   "version": "1.0.0",
-  "description": "AI-powered web search for AMAN, hosted on Netlify.",
+  "description": "AMAN OS: a personal workspace for source-backed search, AI, projects, and tasks.",
   "type": "module",
   "engines": {
     "node": ">=22 <23"
   },
   "scripts": {
-    "check": "node --check app.js && node --check sw.js && node --check netlify/functions/search.mjs && node --check netlify/functions/lib/search-utils.mjs && node --check netlify/functions/lib/gemini-provider.mjs",
-    "test": "node --test test/search.test.mjs"
+    "check": "node --check app.js && node --check sw.js && node --check lib/os/store.mjs && node --check lib/os/agents.mjs && node --check lib/os/files.mjs && node --check netlify/functions/search.mjs && node --check netlify/functions/ai.mjs && node --check netlify/functions/lib/search-utils.mjs && node --check netlify/functions/lib/gemini-provider.mjs && node --check netlify/functions/lib/search-gateway.mjs && node --check netlify/functions/lib/gemini-ai-provider.mjs && node --check netlify/functions/lib/ai-gateway.mjs",
+    "test": "node --test test/search.test.mjs test/os-core.test.mjs"
   }
 }

@@ -1,11 +1,11 @@
 {
-  "name": "AMAN Search",
-  "short_name": "AMAN Search",
-  "description": "Aman's independent search app",
+  "name": "AMAN OS",
+  "short_name": "AMAN OS",
+  "description": "Aman's workspace for search, AI, projects, and tasks",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#090d1a",
-  "theme_color": "#0b1020",
+  "background_color": "#07111f",
+  "theme_color": "#07111f",
   "icons": [{"src":"aman-mark.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
 }
