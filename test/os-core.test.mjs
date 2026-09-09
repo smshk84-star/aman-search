@@ -3,8 +3,8 @@ import test from "node:test";
 import { createOsStore } from "../lib/os/store.mjs";
 import { createAgentOrchestrator, routeIntent } from "../lib/os/agents.mjs";
 import { MAX_FILE_BYTES, sanitizeFileName, validateProjectFile } from "../lib/os/files.mjs";
-import { createSearchGateway } from "../netlify/functions/lib/search-gateway.mjs";
-import { createAiGateway } from "../netlify/functions/lib/ai-gateway.mjs";
+import { createConfiguredSearchGateway, createSearchGateway } from "../netlify/functions/lib/search-gateway.mjs";
+import { createAiGateway, createConfiguredAiGateway } from "../netlify/functions/lib/ai-gateway.mjs";
 import { createAiHandler, validateMessages } from "../netlify/functions/ai.mjs";
 
 class MemoryStorage {
@@ -67,6 +67,22 @@ test("search gateway falls back without leaking provider details", async () => {
   assert.equal(session.provider.id, "fallback");
   const events = []; for await (const event of gateway.events(session)) events.push(event);
   assert.equal(events[0].answer, "Fallback");
+});
+
+test("no-credential development providers identify mock output honestly", async () => {
+  const search = createConfiguredSearchGateway({ env: {} });
+  const searchSession = await search.open({ query: "today's news" });
+  const searchEvents = []; for await (const event of search.events(searchSession)) searchEvents.push(event);
+  assert.equal(searchSession.provider.id, "development-mock-search");
+  assert.equal(searchEvents.at(-1).developmentMock, true);
+  assert.match(searchEvents.at(-1).answer, /did not perform a live web search/i);
+
+  const ai = createConfiguredAiGateway({ env: {} });
+  const aiSession = await ai.open({ messages: [{ role: "user", content: "hello" }] });
+  const aiEvents = []; for await (const event of ai.events(aiSession)) aiEvents.push(event);
+  assert.equal(aiSession.provider.id, "development-mock-ai");
+  assert.equal(aiEvents.at(-1).developmentMock, true);
+  assert.match(aiEvents.at(-1).answer, /development mock mode/i);
 });
 
 test("AI gateway and handler keep the browser SSE contract", async () => {
