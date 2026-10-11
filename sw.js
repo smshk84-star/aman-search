@@ -1,6 +1,7 @@
 const CACHE = "aman-os-v2";
 const APP_SHELL = [
   "./", "./index.html", "./styles.css", "./app.js", "./manifest.webmanifest", "./aman-mark.svg",
+  "./icon-192.png", "./icon-512.png", "./icon-1024.png",
   "./lib/os/store.mjs", "./lib/os/agents.mjs", "./lib/os/files.mjs", "./lib/os/chat.mjs",
 ];
 

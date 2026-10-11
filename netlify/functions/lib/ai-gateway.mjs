@@ -1,4 +1,5 @@
 import { createGeminiAiProvider, DEFAULT_AI_MODEL } from "./gemini-ai-provider.mjs";
+import { createOllamaAiProvider, DEFAULT_OLLAMA_MODEL } from "./ollama-provider.mjs";
 
 const isProduction = (env) => env.NODE_ENV === "production" || env.CONTEXT === "production";
 const providerError = (status, message, options = {}) => Object.assign(new Error(message), { status, ...options });
@@ -39,7 +40,8 @@ export const createConfiguredAiGateway = ({ env = process.env } = {}) => {
   const requested = env.AI_PROVIDER || (env.GEMINI_API_KEY?.trim() ? "gemini" : "mock");
   const fallbackRequested = env.AI_FALLBACK_PROVIDER;
   const gemini = createGeminiAiProvider({ getApiKey: () => env.GEMINI_API_KEY, getModel: () => env.AI_MODEL || DEFAULT_AI_MODEL });
+  const ollama = createOllamaAiProvider({ getBaseUrl: () => env.OLLAMA_BASE_URL || "http://127.0.0.1:11434", getModel: () => env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL });
   const mock = createMockAiProvider({ env });
-  const resolve = (name) => name === "mock" ? mock : name === "gemini" ? gemini : null;
+  const resolve = (name) => name === "mock" ? mock : name === "gemini" ? gemini : name === "ollama" ? ollama : null;
   return createAiGateway({ primary: resolve(requested), fallback: resolve(fallbackRequested) });
 };

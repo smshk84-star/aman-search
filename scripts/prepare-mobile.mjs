@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
 const out = resolve(root, "mobile", "www");
-const files = ["index.html", "app.js", "styles.css", "manifest.webmanifest", "sw.js", "aman-mark.svg"];
+const files = ["index.html", "app.js", "styles.css", "manifest.webmanifest", "sw.js", "aman-mark.svg", "icon-192.png", "icon-512.png", "icon-1024.png"];
 const directories = ["lib"];
 const apiOrigin = String(process.env.AMAN_API_ORIGIN || "").trim().replace(/\/+$/, "");
 

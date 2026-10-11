@@ -8,12 +8,13 @@
     "node": ">=22 <23"
   },
   "scripts": {
+    "dev": "node scripts/dev-server.mjs",
     "mobile:prepare": "node scripts/prepare-mobile.mjs",
     "mobile:sync": "npm run mobile:prepare && npx cap sync android",
     "mobile:open": "npm run mobile:sync && npx cap open android",
     "mobile:build": "npm run mobile:sync && cd android && gradlew.bat bundleRelease",
-    "check": "node --check app.js && node --check sw.js && node --check lib/os/store.mjs && node --check lib/os/agents.mjs && node --check lib/os/files.mjs && node --check lib/os/chat.mjs && node --check netlify/functions/search.mjs && node --check netlify/functions/ai.mjs && node --check netlify/functions/lib/search-utils.mjs && node --check netlify/functions/lib/gemini-provider.mjs && node --check netlify/functions/lib/search-gateway.mjs && node --check netlify/functions/lib/gemini-ai-provider.mjs && node --check netlify/functions/lib/ai-gateway.mjs",
-    "test": "node --test test/search.test.mjs test/os-core.test.mjs test/chat-api.test.mjs test/chat-ui.test.mjs"
+    "check": "node --check app.js && node --check sw.js && node --check lib/os/store.mjs && node --check lib/os/agents.mjs && node --check lib/os/files.mjs && node --check lib/os/chat.mjs && node --check netlify/functions/search.mjs && node --check netlify/functions/ai.mjs && node --check netlify/functions/lib/search-utils.mjs && node --check netlify/functions/lib/gemini-provider.mjs && node --check netlify/functions/lib/search-gateway.mjs && node --check netlify/functions/lib/gemini-ai-provider.mjs && node --check netlify/functions/lib/ollama-provider.mjs && node --check netlify/functions/lib/ai-gateway.mjs",
+    "test": "node --test test/search.test.mjs test/os-core.test.mjs test/chat-api.test.mjs test/chat-ui.test.mjs test/ollama.test.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.5.3",
