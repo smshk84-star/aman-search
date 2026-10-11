@@ -6,9 +6,10 @@ AMAN OS is a personal, browser-local workspace built on the original AMAN Search
 
 - Source-backed search through a server-only provider gateway. Answers stream to the browser with safe linked citations and source cards.
 - Provider-neutral search and AI gateways with bounded provider fallback points.
-- AI Chat with persistent conversations and streaming support.
+- ChatGPT-style AI workspace with persistent conversation history, streaming responses, Markdown, code blocks with copy actions, regenerate, stop generation, edit-and-resend, conversation search, pin/rename/delete, export, theme preferences, and safe text attachments.
 - Browser-local projects, messages, tasks, files, preferences, activity, and AgentRun records. Data persists across refreshes in the same browser profile.
 - Command Center routing for search/research, tasks, files, and general AI requests.
+- Dedicated web-search mode inside chat, with source cards and grounded citations when the provider is configured.
 - Safe file upload boundary: supported document/image types only, filename sanitization, and a 1.5 MB browser-local limit.
 - PWA app shell with a network-only policy for Netlify function requests.
 
@@ -53,7 +54,7 @@ npm.cmd test
 git diff --check
 ```
 
-The automated suite covers provider error handling, retries, cancellation, SSE parsing, citations, safe URLs, gateway fallback, AI SSE output, local persistence, safe file validation, task storage, and agent routing.
+The automated suite covers provider error handling, retries, cancellation, SSE parsing, citations, safe URLs, gateway fallback, AI SSE output, Markdown safety, chat context limits, attachment validation, local persistence, conversation operations, safe file validation, task storage, and agent routing.
 
 ## Documentation
 
