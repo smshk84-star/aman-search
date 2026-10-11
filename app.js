@@ -5,6 +5,8 @@ import { renderMarkdown, buildChatMessages, readEventStream, readTextAttachment 
 
 const app = document.getElementById("app");
 const toast = document.getElementById("toast");
+const API_ORIGIN = String(globalThis.__AMAN_API_ORIGIN__ || "").replace(/\/+$/, "");
+const functionUrl = (name) => `${API_ORIGIN}/.netlify/functions/${name}`;
 const store = createOsStore({ storage: localStorage });
 const ui = { view: "chat", search: null, activeConversationId: null, searchAbort: null, run: null, drafts: new Map(), errors: new Map(), historyQuery: "", sidebarOpen: false, status: null, statusError: false };
 const icons = {
@@ -100,7 +102,7 @@ function applyTheme() {
 
 async function refreshStatus() {
   try {
-    const response = await fetch("/.netlify/functions/ai", { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(8000) });
+    const response = await fetch(functionUrl("ai"), { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error("Unavailable");
     ui.status = await response.json(); ui.statusError = false;
   } catch { ui.statusError = true; ui.status = null; }
@@ -127,7 +129,7 @@ async function runSearch(query) {
   ui.searchAbort?.abort(); const controller = new AbortController(); ui.searchAbort = controller;
   ui.search = { query, answer: "", annotations: [], sources: [], streaming: true, developmentMock: false }; render();
   try {
-    const response = await fetch("/.netlify/functions/search", { method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" }, body: JSON.stringify({ query }), signal: controller.signal });
+    const response = await fetch(functionUrl("search"), { method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" }, body: JSON.stringify({ query }), signal: controller.signal });
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || "Search request failed.");
     for await (const event of readSse(response.body)) {
       if (controller.signal.aborted) return;
@@ -237,7 +239,7 @@ async function requestAnswer(conversationId) {
   ui.run = run; ui.errors.delete(conversationId); render();
   try {
     const body = run.mode === "web" ? { query: userMessage.content } : { messages: buildChatMessages(history.slice(0, -1), userMessage.content, `You are AMAN, a thoughtful, capable AI assistant. Answer in the user's language. Use clear Markdown, code fences for code, and be honest about uncertainty. Never pretend to browse or execute actions. ${project ? `Project context: ${project.name}. ${project.description}` : ""}`) };
-    const response = await fetch(`/.netlify/functions/${run.mode === "web" ? "search" : "ai"}`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" }, body: JSON.stringify(body), signal: run.controller.signal });
+    const response = await fetch(functionUrl(run.mode === "web" ? "search" : "ai"), { method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" }, body: JSON.stringify(body), signal: run.controller.signal });
     if (!response.ok) { const payload = await response.json().catch(() => ({})); throw new Error(payload.error || (response.status === 429 ? "Too many requests. Wait a minute and try again." : `Request failed (${response.status}). Please try again.`)); }
     for await (const event of readEventStream(response.body)) {
       if (run.controller.signal.aborted) break;

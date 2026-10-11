@@ -46,6 +46,20 @@ For local real-provider testing, create a non-committed `.env` containing `GEMIN
 3. Deploy the branch that contains the AMAN OS changes.
 4. Verify a search and an AI chat request; responses should stream from `/.netlify/functions/search` and `/.netlify/functions/ai`.
 
+## Android / Play Store packaging
+
+The existing web application is packaged with Capacitor; the Android bridge lives in `android/` and uses the same frontend and Netlify backend. It does not expose provider secrets.
+
+Install Android Studio with an Android SDK and Java, then set the deployed API origin and sync:
+
+```powershell
+$env:AMAN_API_ORIGIN = "https://YOUR-NETLIFY-SITE.netlify.app"
+npm.cmd run mobile:sync
+npm.cmd run mobile:open
+```
+
+Build a release bundle from Android Studio or with `npm.cmd run mobile:build` after configuring a private upload keystore. Upload the resulting signed `.aab` to Google Play Console. Store listing, privacy policy, data safety declaration, screenshots, content rating, and developer account verification remain external Play Console requirements. See [mobile/README.md](mobile/README.md).
+
 ## Verification
 
 ```sh

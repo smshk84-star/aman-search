@@ -3,4 +3,11 @@
 !.env.example
 .netlify
 node_modules
+.gradle
+android/.gradle
+android/build
+android/app/build
+mobile/www
+*.keystore
+*.jks
 .DS_Store
