@@ -396,7 +396,6 @@ app.addEventListener("click", async (event) => {
   } catch (error) { notify(error.message || "That action could not be completed.", "error"); }
 });
 
-function placeholderView(title, text) { shell(`<div class="card placeholder"><div class="eyebrow">Extension boundary</div><h2>${esc(title)}</h2><p class="muted">${esc(text)}</p></div>`); }
 function render() {
   if (ui.view === "search") return searchView(); if (ui.view === "chat") return chatView(); if (ui.view === "projects") return projectsView(); if (ui.view === "tasks") return tasksView(); if (ui.view === "files") return filesView(); if (ui.view === "agents") return agentsView(); if (ui.view === "settings") return settingsView();
   return chatView();

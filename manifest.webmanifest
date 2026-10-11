@@ -1,11 +1,11 @@
 {
-  "name": "AMAN OS",
-  "short_name": "AMAN OS",
-  "description": "Aman's workspace for search, AI, projects, and tasks",
+  "name": "AMAN — Personal AI Workspace",
+  "short_name": "AMAN",
+  "description": "Chat, source-backed web search, projects, and tasks in one private browser workspace.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#07111f",
-  "theme_color": "#07111f",
+  "background_color": "#fcfcfa",
+  "theme_color": "#fcfcfa",
   "icons": [{"src":"aman-mark.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]
 }

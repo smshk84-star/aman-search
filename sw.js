@@ -1,7 +1,7 @@
-const CACHE = "aman-os-v1";
+const CACHE = "aman-os-v2";
 const APP_SHELL = [
   "./", "./index.html", "./styles.css", "./app.js", "./manifest.webmanifest", "./aman-mark.svg",
-  "./lib/os/store.mjs", "./lib/os/agents.mjs", "./lib/os/files.mjs",
+  "./lib/os/store.mjs", "./lib/os/agents.mjs", "./lib/os/files.mjs", "./lib/os/chat.mjs",
 ];
 
 self.addEventListener("install", (event) => {
