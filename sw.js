@@ -1,4 +1,4 @@
-const CACHE = "aman-os-v2";
+const CACHE = "aman-os-v3";
 const APP_SHELL = [
   "./", "./index.html", "./styles.css", "./app.js", "./manifest.webmanifest", "./aman-mark.svg",
   "./icon-192.png", "./icon-512.png", "./icon-1024.png",
@@ -26,6 +26,16 @@ self.addEventListener("fetch", (event) => {
 
   if (request.mode === "navigate") {
     event.respondWith(fetch(request).catch(() => caches.match("./index.html")));
+    return;
+  }
+
+  const networkFirst = ["/app.js", "/styles.css", "/runtime-config.js"].some((path) => url.pathname.endsWith(path));
+  if (networkFirst) {
+    event.respondWith(fetch(request).then((response) => {
+      const copy = response.clone();
+      caches.open(CACHE).then((cache) => cache.put(request, copy)).catch(() => {});
+      return response;
+    }).catch(() => caches.match(request)));
     return;
   }
 
